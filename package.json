@@ -1,0 +1,51 @@
+{
+  "name": "relaylab",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.typecheck.json",
+    "test:unit": "node --import tsx --test tests/unit/**/*.test.ts",
+    "test:integration": "node --import tsx --test --test-concurrency=1 tests/integration/**/*.test.ts",
+    "migrate": "tsx src/db/migrate-cli.ts",
+    "publisher": "tsx src/messaging/publisher-main.ts",
+    "consumer": "tsx src/messaging/consumer-main.ts",
+    "demo:recovery": "tsx tests/integration/recovery-scenario.ts",
+    "demo:crash-windows": "tsx tests/integration/crash-windows.ts",
+    "demo:git-worker": "tsx tests/integration/demo-git-worker.ts",
+    "test:git-worker-crash": "tsx tests/integration/git-worker-crash.ts",
+    "demo:handoff": "tsx tests/integration/demo-handoff.ts",
+    "test:handoff-crash": "tsx tests/integration/git-worker-handoff-crash.ts",
+    "test:telemetry-collector": "node --import tsx --test tests/integration/telemetry-collector.manual.ts",
+    "quarantine:inspect": "tsx src/db/quarantine-cli.ts",
+    "test:metrics": "node --import tsx --test tests/integration/metrics.manual.ts",
+    "test:monitoring-scenarios": "node --import tsx --test tests/integration/monitoring-scenarios.manual.ts",
+    "docker:build-verify-image": "docker build -t relaylab-verify:24.21.0-alpine3.24 infra/verify-image",
+    "test:docker-verify": "node --import tsx --test tests/integration/docker-verify.test.ts",
+    "demo:k8s-messaging": "tsx tests/integration/demo-k8s-messaging.ts"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "1.9.1",
+    "@opentelemetry/context-async-hooks": "2.12.0",
+    "@opentelemetry/core": "2.12.0",
+    "@opentelemetry/exporter-prometheus": "0.223.0",
+    "@opentelemetry/exporter-trace-otlp-http": "0.223.0",
+    "@opentelemetry/resources": "2.12.0",
+    "@opentelemetry/sdk-metrics": "2.12.0",
+    "@opentelemetry/sdk-node": "0.223.0",
+    "@opentelemetry/sdk-trace-base": "2.12.0",
+    "@opentelemetry/semantic-conventions": "1.43.0",
+    "effect": "^3.11.0",
+    "mysql2": "^3.11.5",
+    "nats": "^2.28.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
