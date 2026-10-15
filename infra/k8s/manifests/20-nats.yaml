@@ -1,0 +1,107 @@
+# Phase 3A Part B: isolated, Kubernetes-local NATS JetStream. Same
+# image/tag as infra/compose.yaml (nats:2.10-alpine), but UNLIKE
+# compose.yaml this adds real persistence: `-sd /data` backed by a PVC,
+# so JetStream stream/consumer state survives pod replacement (it does
+# NOT survive cluster teardown -- see docs/KUBERNETES.md "persistence").
+# A StatefulSet for the same reason as MySQL: one PVC per pod identity,
+# stable DNS, even at replicas: 1. No auth configured, matching
+# compose.yaml's own documented local-dev-only stance (bound inside the
+# cluster/namespace only, never a public interface).
+apiVersion: v1
+kind: Service
+metadata:
+  name: relaylab-nats
+  namespace: relaylab
+  labels:
+    app: relaylab-nats
+spec:
+  clusterIP: None
+  selector:
+    app: relaylab-nats
+  ports:
+    - name: client
+      port: 4222
+      targetPort: 4222
+    - name: monitor
+      port: 8222
+      targetPort: 8222
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: relaylab-nats-lb
+  namespace: relaylab
+  labels:
+    app: relaylab-nats
+spec:
+  selector:
+    app: relaylab-nats
+  ports:
+    - name: client
+      port: 4222
+      targetPort: 4222
+    - name: monitor
+      port: 8222
+      targetPort: 8222
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: relaylab-nats
+  namespace: relaylab
+spec:
+  serviceName: relaylab-nats
+  replicas: 1
+  selector:
+    matchLabels:
+      app: relaylab-nats
+  template:
+    metadata:
+      labels:
+        app: relaylab-nats
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: nats
+          image: nats:2.10-alpine
+          args: ["-js", "-sd", "/data", "-m", "8222"]
+          ports:
+            - containerPort: 4222
+            - containerPort: 8222
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8222
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8222
+            periodSeconds: 10
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8222
+            periodSeconds: 5
+            failureThreshold: 3
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

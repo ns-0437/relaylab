@@ -1,0 +1,27 @@
+# Phase 3A Part B: non-secret settings only. Every value here is read by
+# src/config.ts's existing env-var reads -- no new config keys were
+# invented for Kubernetes; these are the SAME names publisher-main.ts/
+# consumer-main.ts already read when run on the host against
+# infra/compose.yaml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: relaylab-config
+  namespace: relaylab
+data:
+  RELAYLAB_MYSQL_HOST: "relaylab-mysql.relaylab.svc.cluster.local"
+  RELAYLAB_MYSQL_PORT: "3306"
+  RELAYLAB_MYSQL_DATABASE: "relaylab"
+  RELAYLAB_NATS_URL: "relaylab-nats.relaylab.svc.cluster.local:4222"
+  RELAYLAB_ENV: "k8s-local"
+  RELAYLAB_HEALTH_PORT: "9470"
+  # Deliberately NOT setting RELAYLAB_OTEL_DISABLED=1: that flag also
+  # gates the Prometheus /metrics endpoint (see src/telemetry/metrics.ts
+  # isMetricsEnabled -- ONE flag for both signals, by this project's own
+  # design), which this phase DOES want working for the pod-replacement
+  # demo's evidence. No OTel Collector is deployed to the cluster this
+  # phase, so the trace-export side will retry an OTLP POST to
+  # 127.0.0.1:4318 and fail -- the SAME already-documented, bounded,
+  # non-fatal behavior as running `npm run publisher` on the host
+  # without `docker compose --profile observability up` (see
+  # docs/OBSERVABILITY.md), not a new condition introduced here.
