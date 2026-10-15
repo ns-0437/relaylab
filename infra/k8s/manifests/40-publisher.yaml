@@ -1,0 +1,115 @@
+# Phase 3A Part B: the existing publisher poll loop (src/messaging/
+# publisher-main.ts), unmodified in behavior -- only a health-check HTTP
+# server was added (src/telemetry/health.ts) for the probes below.
+#
+# replicas: 1 is NOT a placeholder -- it is the actual coordination
+# invariant this project implements today (publisher_leader DB-backed
+# lock assumes exactly one owner at a time is useful to run; running a
+# second replica would just mean a second process losing the leadership
+# race forever). See CLAUDE.md "Core correctness invariants." Do not
+# raise this without first implementing and proving multi-instance
+# leader-election semantics beyond what publisher-lock.ts does today.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: relaylab-publisher
+  namespace: relaylab
+  labels:
+    app: relaylab-publisher
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # never two publisher pods mid-rollout, even briefly
+  selector:
+    matchLabels:
+      app: relaylab-publisher
+  template:
+    metadata:
+      labels:
+        app: relaylab-publisher
+    spec:
+      # This workload never calls the Kubernetes API -- disabling the
+      # token mount is strictly a reduction in attack surface, not a
+      # functional requirement.
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: publisher
+          image: relaylab-app:local
+          imagePullPolicy: IfNotPresent # loaded directly into kind's node via `kind load docker-image`, never pulled from a registry
+          command: ["node", "dist/messaging/publisher-main.js"]
+          envFrom:
+            - configMapRef:
+                name: relaylab-config
+          env:
+            - name: RELAYLAB_MYSQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: relaylab-mysql-credentials
+                  key: app-user
+            - name: RELAYLAB_MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: relaylab-mysql-credentials
+                  key: app-password
+          ports:
+            - name: metrics
+              containerPort: 9464
+            - name: health
+              containerPort: 9470
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          # Startup/readiness/liveness are kept DISTINCT (see
+          # src/telemetry/health.ts): startup gates on the one-time
+          # initial NATS connect; liveness NEVER inspects NATS/MySQL (so
+          # a transient broker/DB outage cannot cause a restart loop);
+          # readiness reflects live NATS connectivity right now.
+          startupProbe:
+            httpGet:
+              path: /healthz/startup
+              port: 9470
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz/live
+              port: 9470
+            periodSeconds: 10
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /healthz/ready
+              port: 9470
+            periodSeconds: 5
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: relaylab-publisher
+  namespace: relaylab
+  labels:
+    app: relaylab-publisher
+spec:
+  selector:
+    app: relaylab-publisher
+  ports:
+    - name: metrics
+      port: 9464
+      targetPort: 9464
+    - name: health
+      port: 9470
+      targetPort: 9470

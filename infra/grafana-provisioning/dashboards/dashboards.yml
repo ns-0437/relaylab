@@ -1,0 +1,14 @@
+# Phase 1.2.1 patch, Part D: tells Grafana to load every dashboard JSON
+# file under infra/grafana-dashboards/ (bind-mounted -- see
+# compose.yaml) as a provisioned, committed-as-code dashboard.
+apiVersion: 1
+
+providers:
+  - name: relaylab
+    orgId: 1
+    folder: RelayLab
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/provisioning/relaylab-dashboards

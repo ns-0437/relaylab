@@ -1,0 +1,129 @@
+# Phase 1.2.1 patch, Part E: a SMALL set of actionable alerts. Every
+# threshold below is explicitly a DEVELOPMENT DEFAULT (this project has
+# never run at a scale where a measured production SLO would mean
+# anything -- see CLAUDE.md "rules for reporting evidence"), not a
+# production SLO. Full runbook text (what it means / what to inspect /
+# safe recovery / what it does NOT prove) lives in docs/RUNBOOKS.md,
+# linked via `runbook_url`. No email/Slack/webhook receivers are
+# configured anywhere in this repo -- these rules only ever reach
+# Prometheus's own Alertmanager-less `ALERTS` series and the Prometheus
+# UI, which is what this phase's validation checks against (see
+# docs/PROGRESS.md "Part F").
+groups:
+  - name: relaylab-dev-alerts
+    rules:
+      - alert: RelaylabServiceScrapeDown
+        expr: up{job=~"relaylab-.*"} == 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Prometheus cannot scrape {{ $labels.job }} ({{ $labels.instance }})"
+          description: "The {{ $labels.job }} target has been unreachable for over a minute."
+          runbook_url: "docs/RUNBOOKS.md#relaylabservicescrapedown"
+
+      - alert: RelaylabOutboxBacklogHigh
+        expr: relaylab_outbox_unpublished_count > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Outbox backlog > 100 unpublished events for 5+ minutes"
+          description: "relaylab_outbox_unpublished_count = {{ $value }}."
+          runbook_url: "docs/RUNBOOKS.md#relaylaboutboxbacklophigh"
+
+      - alert: RelaylabOldestUnpublishedEventTooOld
+        expr: relaylab_outbox_oldest_unpublished_age_seconds > 60
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The oldest unpublished outbox event is over 60s old"
+          description: "relaylab_outbox_oldest_unpublished_age_seconds = {{ $value }}."
+          runbook_url: "docs/RUNBOOKS.md#relaylaboldestunpublishedeventtooold"
+
+      - alert: RelaylabGapBacklogPersisting
+        expr: relaylab_pending_gap_events_count > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pending gap-buffered events have persisted for 10+ minutes"
+          description: "relaylab_pending_gap_events_count = {{ $value }}; see relaylab_tasks_with_unresolved_gaps_count for how many tasks are affected."
+          runbook_url: "docs/RUNBOOKS.md#relaylabgapbacklogpersisting"
+
+      - alert: RelaylabDurableGaugeRefreshStale
+        expr: (time() - relaylab_gauge_last_refresh_success_timestamp_seconds) > 30
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Durable gauge group {{ $labels.group }} has not refreshed successfully in 30+ seconds"
+          description: "Treat every OTHER relaylab_outbox_*/relaylab_pending_gap_*/relaylab_tasks_with_unresolved_gaps_*/relaylab_quarantined_* value as STALE, not current, while this fires."
+          runbook_url: "docs/RUNBOOKS.md#relaylabdurablegaugerefreshstale"
+
+      - alert: RelaylabQuarantinedMessagesPresent
+        expr: relaylab_quarantined_messages_count > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} message(s) sit in durable dead-letter quarantine"
+          description: "Inspect with `npm run quarantine:inspect` -- see docs/OBSERVABILITY.md 'dead-letter quarantine'."
+          runbook_url: "docs/RUNBOOKS.md#relaylabquarantinedmessagespresent"
+
+      # Phase 2A patch, Part A: closes a real gap the prior report
+      # understated. `up == 0` (RelaylabServiceScrapeDown above) only
+      # catches "the TARGET itself is unreachable" -- it says nothing
+      # about a target that scrapes successfully but whose EXPECTED
+      # durable-gauge freshness series never appears at all (e.g. the
+      # refresher crashed/never started, or MySQL was unreachable from
+      # the very first refresh attempt onward). `RelaylabDurableGaugeRefreshStale`
+      # cannot catch this EITHER: it compares `time()` against an
+      # EXISTING `relaylab_gauge_last_refresh_success_timestamp_seconds`
+      # series, which (by design -- see docs/METRICS.md "missing metrics
+      # must not silently appear as healthy zeroes") never gets a first
+      # data point until the FIRST successful refresh -- so a refresher
+      # that never once succeeded produces an ABSENT series, not a stale
+      # one, and `time() - <absent>` yields no alert at all.
+      #
+      # One rule PER (service, expected gauge group) pair -- NOT a single
+      # generic "any group missing on any job" rule -- because a service
+      # must never be alerted on for a gauge group it isn't supposed to
+      # export (a STANDBY publisher legitimately never exports the
+      # "outbox" group; see docs/METRICS.md "gauge ownership" --
+      # `relaylab_publisher_leadership_state == 1` excludes that
+      # legitimate case explicitly). `for: 2m` is the startup grace
+      # period -- generous relative to the refresher's own ~5s interval
+      # (it refreshes immediately on start, so a healthy process clears
+      # this within seconds, not minutes) and consistent with this
+      # project's other alert thresholds.
+      - alert: RelaylabPublisherOutboxFreshnessMissing
+        expr: (up{job="relaylab-publisher"} == 1 and relaylab_publisher_leadership_state == 1) unless on(job, instance) relaylab_gauge_last_refresh_success_timestamp_seconds{group="outbox"}
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Publisher {{ $labels.instance }} is up and believes it is leader, but has never recorded a successful outbox-gauge refresh"
+          description: "relaylab_gauge_last_refresh_success_timestamp_seconds{group=\"outbox\"} is entirely ABSENT for this instance -- distinct from stale (see RelaylabDurableGaugeRefreshStale). Treat relaylab_outbox_unpublished_count/relaylab_outbox_oldest_unpublished_age_seconds as UNKNOWN, not healthy, for this instance."
+          runbook_url: "docs/RUNBOOKS.md#relaylabpublisheroutboxfreshnessmissing"
+
+      - alert: RelaylabConsumerGapsFreshnessMissing
+        expr: up{job="relaylab-consumer"} == 1 unless on(job, instance) relaylab_gauge_last_refresh_success_timestamp_seconds{group="gaps"}
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Consumer {{ $labels.instance }} is up but has never recorded a successful gap/quarantine-gauge refresh"
+          description: "relaylab_gauge_last_refresh_success_timestamp_seconds{group=\"gaps\"} is entirely ABSENT for this instance -- distinct from stale. Treat relaylab_pending_gap_events_count/relaylab_tasks_with_unresolved_gaps_count/relaylab_quarantined_messages_count as UNKNOWN, not healthy, for this instance."
+          runbook_url: "docs/RUNBOOKS.md#relaylabconsumergapsfreshnessmissing"
+
+      - alert: RelaylabDuplicateConsumerGaugeExporters
+        expr: relaylab_consumer_gauge_exporter_count > 1
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} consumer instances are exporting gap/quarantine gauges for the same consumer -- an UNSUPPORTED topology"
+          description: "Horizontal consumer scaling is not supported (see CLAUDE.md) -- relaylab_pending_gap_events_count/relaylab_tasks_with_unresolved_gaps_count/relaylab_quarantined_messages_count may now be duplicated across instances."
+          runbook_url: "docs/RUNBOOKS.md#relaylabduplicateconsumergaugeexporters"

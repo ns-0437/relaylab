@@ -1,0 +1,111 @@
+# Phase 3A Part B: the existing consumer poll loop (src/messaging/
+# consumer-main.ts), unmodified in behavior -- same health-server
+# addition as the publisher (see 40-publisher.yaml's header comment).
+#
+# replicas: 1 for the SAME reason as the publisher, but for a different
+# concrete mechanism: the durable NATS consumer name / consumer_name
+# partition key in task_consumer_state assumes exactly ONE process
+# instance exposing it at a time (see consumer-main.ts's own comment on
+# `relaylab_consumer_gauge_exporter_count` and CLAUDE.md "Messaging and
+# deduplication rules"). A second replica sharing the same durable
+# consumer name is UNSUPPORTED today, not merely untested -- do not raise
+# this without first implementing per-instance partitioning or exclusive
+# delivery semantics.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: relaylab-consumer
+  namespace: relaylab
+  labels:
+    app: relaylab-consumer
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: relaylab-consumer
+  template:
+    metadata:
+      labels:
+        app: relaylab-consumer
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: consumer
+          image: relaylab-app:local
+          imagePullPolicy: IfNotPresent
+          command: ["node", "dist/messaging/consumer-main.js"]
+          envFrom:
+            - configMapRef:
+                name: relaylab-config
+          env:
+            - name: RELAYLAB_MYSQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: relaylab-mysql-credentials
+                  key: app-user
+            - name: RELAYLAB_MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: relaylab-mysql-credentials
+                  key: app-password
+            - name: RELAYLAB_METRICS_PORT
+              value: "9465"
+          ports:
+            - name: metrics
+              containerPort: 9465
+            - name: health
+              containerPort: 9470
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          startupProbe:
+            httpGet:
+              path: /healthz/startup
+              port: 9470
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz/live
+              port: 9470
+            periodSeconds: 10
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /healthz/ready
+              port: 9470
+            periodSeconds: 5
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: relaylab-consumer
+  namespace: relaylab
+  labels:
+    app: relaylab-consumer
+spec:
+  selector:
+    app: relaylab-consumer
+  ports:
+    - name: metrics
+      port: 9465
+      targetPort: 9465
+    - name: health
+      port: 9470
+      targetPort: 9470

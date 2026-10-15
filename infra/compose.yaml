@@ -1,0 +1,133 @@
+# Local-only dependencies for RelayLab Phase 1. Development credentials
+# only -- never used outside this compose file, bound to localhost.
+name: relaylab
+
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: relaylab_dev_root
+      MYSQL_DATABASE: relaylab
+      MYSQL_USER: relaylab_dev
+      MYSQL_PASSWORD: relaylab_dev_password
+    ports:
+      - "127.0.0.1:3306:3306"
+    volumes:
+      - relaylab_mysql_data:/var/lib/mysql
+      - ./mysql-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prelaylab_dev_root"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  nats:
+    image: nats:2.10-alpine
+    restart: unless-stopped
+    command: ["-js", "-m", "8222"]
+    ports:
+      # Host port 4222 falls inside a Windows dynamic-port exclusion range
+      # on some machines (netsh int ipv4 show excludedportrange), so this
+      # binds the container's 4222 to host port 24222 instead.
+      - "127.0.0.1:24222:4222"
+      - "127.0.0.1:8222:8222"
+
+  # Optional observability profile (Phase 1.2 audit, Part B.4). Not
+  # started by a plain `docker compose up` -- requires `--profile
+  # observability` (see docs/OBSERVABILITY.md "exact commands"), since
+  # most work on this project does not need tracing.
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.116.1
+    restart: unless-stopped
+    profiles: ["observability"]
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+      # Bind-mounted (not a named volume) specifically so the test runner
+      # on the HOST can read the structured JSONL evidence file directly
+      # -- see infra/otel-collector-config.yaml's `file` exporter and
+      # tests/integration/telemetry-collector.manual.ts.
+      - ./otel-evidence:/var/lib/otel-evidence
+    ports:
+      - "127.0.0.1:4318:4318" # OTLP/HTTP -- what RELAYLAB_OTEL_EXPORTER_OTLP_ENDPOINT points at by default
+      - "127.0.0.1:4317:4317" # OTLP/gRPC, unused by this project but part of the standard receiver
+
+  # Phase 1.2.1 patch, Part D. Same optional `observability` profile as
+  # otel-collector above -- not started by a plain `docker compose up`.
+  # Local development only: no auth configured (acceptable because
+  # Prometheus is bound to 127.0.0.1 only, never a public interface), no
+  # remote_write, no alertmanager/notification integration wired up
+  # anywhere in this repo.
+  prometheus:
+    image: prom/prometheus:v3.0.1
+    restart: unless-stopped
+    profiles: ["observability"]
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      # Explicit, small retention limits -- this is a dev scrape target,
+      # not a long-term metrics store.
+      - "--storage.tsdb.retention.time=3d"
+      - "--storage.tsdb.retention.size=512MB"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus-alerts.yml:/etc/prometheus/alerts.yml:ro
+      # Behavior-test fixtures (promtool test rules) -- bind-mounted so
+      # `docker exec ... promtool test rules prometheus-alert-tests.yml`
+      # works directly against the real running container without a
+      # manual `docker cp` step. Not read by Prometheus itself at
+      # runtime (not listed in prometheus.yml's rule_files).
+      - ./prometheus-alert-tests.yml:/etc/prometheus/prometheus-alert-tests.yml:ro
+      - relaylab_prometheus_data:/prometheus
+    ports:
+      # Host port 9090 (and, empirically, EVERY host port tried
+      # immediately after a FAILED bind attempt, e.g. 9099 right after
+      # 9090 failed) reproducibly failed to bind on this Windows machine:
+      # "ports are not available ... forbidden by its access permissions"
+      # from dockerd, for a port not listed by `netsh interface ipv4 show
+      # excludedportrange`. Isolated via `docker run` (bypassing Compose
+      # entirely) that a FRESH, never-previously-attempted port bound
+      # immediately and cleanly, while a port that had just failed once
+      # stayed stuck -- i.e. a failed bind attempt on this machine leaves
+      # behind some opaque, short-lived Windows-side reservation on that
+      # exact port, not a real conflict with another process (confirmed
+      # via `Get-NetTCPConnection`, which showed nothing listening on
+      # either 9090 or 9099). Same general CATEGORY of issue as NATS's
+      # host port 4222 -> 24222 workaround below (a Windows port-binding
+      # quirk, not an application bug), but a different specific cause.
+      # 9298 was verified free via a direct `docker run` test and used
+      # instead. The CONTAINER's own internal port is still Prometheus's
+      # default 9090 -- only the host-side mapping changed.
+      - "127.0.0.1:9298:9090"
+    extra_hosts:
+      # Docker Desktop (Windows/Mac) provides `host.docker.internal`
+      # automatically; this entry is what makes the SAME config also
+      # resolve it on a Linux Docker host, where it is not automatic --
+      # portability, not a Windows-specific hack.
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    restart: unless-stopped
+    profiles: ["observability"]
+    environment:
+      # Local development only -- never a real credential; Grafana is
+      # bound to 127.0.0.1 only below. Change before ever exposing this
+      # beyond localhost.
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: relaylab_dev_only
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ./grafana-provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana-provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana-dashboards:/etc/grafana/provisioning/relaylab-dashboards:ro
+      - relaylab_grafana_data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  relaylab_mysql_data:
+  relaylab_prometheus_data:
+  relaylab_grafana_data:

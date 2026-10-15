@@ -1,0 +1,11 @@
+# Phase 3A Part B: one dedicated namespace for everything this phase
+# deploys. Every manifest/script in infra/k8s targets this namespace
+# explicitly (never the default namespace), and every kubectl invocation
+# in infra/k8s/scripts also passes --namespace explicitly as a second
+# safeguard.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: relaylab
+  labels:
+    app.kubernetes.io/part-of: relaylab

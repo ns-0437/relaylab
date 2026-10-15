@@ -1,0 +1,130 @@
+# Phase 3A Part B: isolated, Kubernetes-local MySQL for RelayLab's own
+# coordination state (TaskStore, publisher leader lock, consumer durable
+# state) -- SEPARATE from infra/compose.yaml's dev MySQL. Same image/tag
+# as compose.yaml (mysql:8.4) so dev and cluster behavior match. A
+# StatefulSet (not a Deployment) specifically for volumeClaimTemplates
+# (one PVC bound to this exact pod identity) and a stable DNS name,
+# even at replicas: 1 -- this project has no multi-primary MySQL story,
+# and none is implemented here.
+#
+# Credentials come ONLY from the `relaylab-mysql-credentials` Secret,
+# created by infra/k8s/scripts/02-up.sh at apply time (never committed --
+# see that script and docs/KUBERNETES.md "secrets"). This manifest never
+# names a password.
+apiVersion: v1
+kind: Service
+metadata:
+  name: relaylab-mysql
+  namespace: relaylab
+  labels:
+    app: relaylab-mysql
+spec:
+  clusterIP: None # headless: stable DNS for the StatefulSet pod, no load-balancing needed at replicas:1
+  selector:
+    app: relaylab-mysql
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: 3306
+---
+# A second, normal (non-headless) Service with the SAME selector, used by
+# `kubectl port-forward svc/relaylab-mysql-lb` from the host -- a plain
+# ClusterIP Service is what port-forward targets reliably; the headless
+# Service above exists for in-cluster DNS, this one for host access.
+apiVersion: v1
+kind: Service
+metadata:
+  name: relaylab-mysql-lb
+  namespace: relaylab
+  labels:
+    app: relaylab-mysql
+spec:
+  selector:
+    app: relaylab-mysql
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: 3306
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: relaylab-mysql
+  namespace: relaylab
+spec:
+  serviceName: relaylab-mysql
+  replicas: 1
+  selector:
+    matchLabels:
+      app: relaylab-mysql
+  template:
+    metadata:
+      labels:
+        app: relaylab-mysql
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: mysql
+          image: mysql:8.4
+          ports:
+            - containerPort: 3306
+          env:
+            - name: MYSQL_DATABASE
+              value: relaylab
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: relaylab-mysql-credentials
+                  key: root-password
+            - name: MYSQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: relaylab-mysql-credentials
+                  key: app-user
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: relaylab-mysql-credentials
+                  key: app-password
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+          # Startup: the official image's own init sequence (first-run
+          # schema bootstrap) can take longer than a normal restart --
+          # failureThreshold*periodSeconds bounds it without that bound
+          # leaking into liveness.
+          startupProbe:
+            exec:
+              command: ["mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p$(MYSQL_ROOT_PASSWORD)"]
+            periodSeconds: 3
+            failureThreshold: 40 # ~120s bound for first-run init
+          # Liveness: same simple ping. A ping failure after startup
+          # succeeded means the server itself is wedged, not "briefly
+          # unreachable" -- that distinction is what startupProbe above
+          # already absorbed.
+          livenessProbe:
+            exec:
+              command: ["mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p$(MYSQL_ROOT_PASSWORD)"]
+            periodSeconds: 10
+            failureThreshold: 6
+          readinessProbe:
+            exec:
+              command: ["mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p$(MYSQL_ROOT_PASSWORD)"]
+            periodSeconds: 5
+            failureThreshold: 3
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi

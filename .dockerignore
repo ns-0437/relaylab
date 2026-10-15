@@ -1,0 +1,13 @@
+node_modules
+dist
+tests
+docs
+evidence
+infra/verify-image
+infra/k8s
+infra/otel-evidence
+infra/grafana-dashboards
+infra/grafana-provisioning
+*.log
+.env
+.env.local

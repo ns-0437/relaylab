@@ -1,0 +1,47 @@
+# Phase 1.2 audit, Part B.4 (original) + Phase 1.2.1 patch section 4
+# (strengthened evidence): local OpenTelemetry Collector. Deliberately
+# minimal -- no tracing UI/backend (explicitly deferred per the audit's
+# own scope). Two exporters:
+#   - `debug`: prints received spans to the Collector's own stdout, for a
+#     human skimming `docker compose logs -f otel-collector`.
+#   - `file`: writes the SAME received spans as OTLP-JSON (one
+#     ExportTraceServiceRequest object per line, JSONL) to a file bind-
+#     mounted into infra/otel-evidence/ on the host. This is the
+#     STRUCTURED evidence tests/integration/telemetry-collector.manual.ts
+#     actually parses (trace/span IDs, parent span IDs, attributes) --
+#     not a string match against human-readable debug-exporter log lines.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  # Bounded batching: never buffers more than a fixed number of spans or
+  # longer than a fixed time before flushing -- see docs/OBSERVABILITY.md
+  # "exporter/Collector configuration".
+  batch:
+    timeout: 2s
+    send_batch_size: 512
+    send_batch_max_size: 1024
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 128
+    spike_limit_mib: 32
+
+exporters:
+  debug:
+    verbosity: detailed
+    sampling_initial: 1000
+    sampling_thereafter: 1
+  file:
+    path: /var/lib/otel-evidence/spans.jsonl
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [debug, file]

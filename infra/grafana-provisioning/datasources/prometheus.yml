@@ -1,0 +1,13 @@
+# Phase 1.2.1 patch, Part D: provisioned Grafana datasource -- local
+# development only, no credentials (Prometheus here has no auth, bound
+# to the Compose-internal network and localhost only -- see compose.yaml).
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: relaylab-prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
