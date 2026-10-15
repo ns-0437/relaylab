@@ -1,0 +1,23 @@
+node_modules/
+dist/
+*.log
+.env
+.env.local
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+.DS_Store
+Thumbs.db
+coverage/
+.release/
+work/
+*.tsbuildinfo
+infra/otel-evidence/*.jsonl
+
+# Phase 3A Part B: generated locally by infra/k8s/scripts/02-up.sh, never committed
+infra/k8s/.kubeconfig
+infra/k8s/.secrets.env
+infra/k8s/.port-forward-pids
