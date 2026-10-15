@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/assets/relaylab-banner.svg" alt="RelayLab — Make the handoff. Keep the proof." width="100%"></p>
+<p align="center"><img src="docs/assets/relaylab-banner.svg" alt="RelayLab â€” Make the handoff. Keep the proof." width="100%"></p>
 
 <p align="center">
   <a href="https://github.com/ns-0437/relaylab/actions/workflows/ci.yml"><img src="https://github.com/ns-0437/relaylab/actions/workflows/ci.yml/badge.svg" alt="Build and unit checks"></a>
@@ -8,7 +8,7 @@
 </p>
 
 <p align="center"><strong>A coding worker can die. Its verified progress should not disappear.</strong></p>
-<p align="center"><a href="#try-the-handoff">Run the demo</a> · <a href="docs/ARCHITECTURE.md">Architecture</a> · <a href="docs/EXECUTION.md">Execution</a> · <a href="docs/KUBERNETES.md">Kubernetes</a> · <a href="docs/VALIDATION.md">Evidence</a></p>
+<p align="center"><a href="#try-the-handoff">Run the demo</a> Â· <a href="docs/ARCHITECTURE.md">Architecture</a> Â· <a href="docs/EXECUTION.md">Execution</a> Â· <a href="docs/KUBERNETES.md">Kubernetes</a> Â· <a href="docs/VALIDATION.md">Evidence</a></p>
 
 RelayLab explores the infrastructure underneath a dependable coding agent: who owns a task, which command already committed, which Git state was verified, and how another worker can resume it without trusting stale authority.
 
@@ -32,10 +32,10 @@ The demo repairs a small repository, verifies the candidate in a constrained Doc
 
 ```mermaid
 flowchart LR
-    A["Worker A · host"] --> V1["Docker verification"]
+    A["Worker A Â· host"] --> V1["Docker verification"]
     V1 --> DB[("MySQL: tasks / receipts / checkpoints / outbox")]
     A --> Artifact["Self-contained Git bundle"]
-    Artifact --> B["Worker B · independent repo"]
+    Artifact --> B["Worker B Â· independent repo"]
     B --> V2["Independent Docker verification"]
     V2 --> DB
     DB --> P["Outbox publisher"]
@@ -104,6 +104,8 @@ The harness pauses real child processes at named failure points and terminates t
 | Kubernetes + kind | Local coordination-service deployment |
 
 Dependency versions are recorded in [package-lock.json](package-lock.json). Vitess compatibility, Electron, Rust, and live model integration are not claimed.
+
+For a guided code review, follow the [reviewer’s tour](docs/DEMO.md).
 
 ## Design decisions worth reading
 
