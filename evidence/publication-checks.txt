@@ -1,0 +1,63 @@
+RelayLab publication verification — 2026-10-15
+Host OS: Windows
+Infrastructure scenarios were not rerun in this publication pass.
+
+$ node.exe --version
+v24.21.0
+
+
+exit_code=0
+
+$ node.exe node_modules/typescript/bin/tsc -p tsconfig.typecheck.json
+
+
+exit_code=0
+
+$ node.exe node_modules/typescript/bin/tsc -p tsconfig.json
+
+
+exit_code=0
+
+$ node.exe --import tsx --test tests/unit/**/*.test.ts
+✔ Checkpoint records digest and bumps seq (0.8882ms)
+✔ RecordVerification for a stale candidate is rejected (0.4339ms)
+✔ RecordVerification for the current candidate succeeds and increments attempt (0.1686ms)
+✔ Complete requires a passed verification (0.182ms)
+✔ fingerprint is independent of object key order (1.0535ms)
+✔ fingerprint differs for different payloads (0.2408ms)
+✔ fingerprint preserves array order as meaningful (0.2291ms)
+[health] listening on :19481 (/healthz/startup, /healthz/live, /healthz/ready)
+[health] listening on :19482 (/healthz/startup, /healthz/live, /healthz/ready)
+✔ startup: /healthz/startup is 503 before markStarted(), 200 after; live/ready are independent of it (37.8526ms)
+[health] listening on :19483 (/healthz/startup, /healthz/live, /healthz/ready)
+✔ healthy state: live is 200 and ready is 200 while isReady() returns true (5.4715ms)
+[health] listening on :19484 (/healthz/startup, /healthz/live, /healthz/ready)
+✔ dependency failure: ready goes 503 when isReady() is false, but live STAYS 200 (never inspects the dependency) (4.032ms)
+[health] listening on :19485 (/healthz/startup, /healthz/live, /healthz/ready)
+✔ recovery: ready returns to 200 once isReady() flips back to true, with no restart/reconnect of the health server itself (3.6032ms)
+✔ shutdown: after health.stop(), the server no longer accepts connections (3.7247ms)
+✔ startDependencyPing: isUp() is false until the first successful ping resolves (111.5787ms)
+✔ startDependencyPing: a ping that never resolves is treated as down once timeoutMs elapses (bounded, not hung forever) (152.8915ms)
+✔ startDependencyPing: recovers to up after a failing ping starts succeeding again (130.9816ms)
+✔ startDependencyPing: stop() halts further ticking (isUp() freezes at its last value) (136.2089ms)
+ℹ tests 16
+ℹ suites 0
+ℹ pass 16
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1007.1176
+
+
+exit_code=0
+
+$ node.exe scripts/check-publication.mjs
+Publication checks passed: 163 tracked paths; README local destinations resolve.
+This heuristic check is not a comprehensive secret scanner or a security certification.
+
+
+exit_code=0
+
+Implementation import comparison: 91 source/test/migration files match their captured original SHA-256.
+SVG XML parse: passed.

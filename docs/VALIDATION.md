@@ -1,6 +1,6 @@
 # Validation ledger
 
-## Publication checks — 2026-10-15
+## Publication checks â€” 2026-10-15
 
 The publication copy was checked on Windows with host Node **v24.21.0**.
 
@@ -14,6 +14,10 @@ The publication copy was checked on Windows with host Node **v24.21.0**.
 The implementation source and SQL migrations were copied from the existing
 working project. This publication pass did not rerun infrastructure integration,
 process-crash, or Kubernetes scenarios, and did not disturb the working cluster.
+
+[Fresh captured output](../evidence/publication-checks.txt) includes the commands,
+exit codes, unit results, and source/test/migration import-identity comparison.
+The SVG banner also passed XML parsing.
 
 ## Historical development evidence
 
