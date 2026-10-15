@@ -1,0 +1,39 @@
+-- Phase 2B.1: closes a real gap found on review of Phase 2B's own
+-- implementation -- `RestoreAcknowledged` was accepted through the
+-- generic `applyTaskCommand` path with NO validation against the
+-- actual handoff it claimed to be acknowledging: nothing checked that
+-- the handoff belonged to this task, that the caller's owner/epoch
+-- matched the handoff's intended DESTINATION, that the artifact being
+-- acknowledged was the one actually authorized at transfer time, or
+-- that the restored commit/tree matched the checkpoint the handoff was
+-- for. `src/db/task-store.ts`'s new `recordRestoreAcknowledgementImpl`
+-- validates all of this, inside the SAME transaction as the receipt/
+-- outbox write, by reading these two new columns plus the EXISTING
+-- `task_checkpoints` table (joined on `checkpoint_digest`, reusing
+-- its already-durable `result_commit`/`result_tree` rather than
+-- duplicating them here -- see that table's own header comment).
+--
+-- `artifact_digest`: bound at `transferOwnership` commit time (the
+-- coordinator now passes the artifact's digest into `transferOwnership`
+-- itself, alongside `checkpointDigest`) -- this is the ONLY handoff-
+-- specific identity fact with no other durable home; the checkpoint's
+-- own commit/tree already live in `task_checkpoints`.
+-- `DEFAULT ''` exists ONLY so this ALTER does not fail against any
+-- `task_handoffs` row written by a pre-Phase-2B.1 session (this
+-- project's disposable dev/test databases) -- no code ever reads an
+-- empty-string value as a real digest; a real row written AFTER this
+-- migration always supplies a real one.
+--
+-- `restore_ack_command_id`: the mechanism for "a different command ID
+-- acknowledging the SAME handoff must not create a second logical
+-- completion event." `command_receipts`' own dedup ledger is keyed by
+-- `command_id` alone, so it cannot catch a retry that (by accident or
+-- by a differently-generated id) uses a NEW, never-seen `command_id`
+-- for a handoff that was already, durably, successfully acknowledged
+-- under a DIFFERENT one. Set exactly once, atomically, in the SAME
+-- transaction as the first successful acknowledgement's receipt/outbox
+-- write; a later attempt with any OTHER `command_id` sees this already
+-- set and is rejected before ever reaching `applyCommand`.
+ALTER TABLE task_handoffs
+  ADD COLUMN artifact_digest CHAR(64) NOT NULL DEFAULT '' AFTER checkpoint_digest,
+  ADD COLUMN restore_ack_command_id VARCHAR(191) NULL AFTER artifact_digest;
