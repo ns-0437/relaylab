@@ -1,0 +1,24 @@
+name: Reproducible failure
+description: Report a concrete failure with environment and expected behavior.
+body:
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and observed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction and commands
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Runtime and infrastructure versions
+      description: Include OS, Node, Docker, and the stack used. Never paste secrets.
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Sanitized evidence and durable-state observations
