@@ -1,0 +1,133 @@
+{
+  "title": "RelayLab Overview (dev)",
+  "uid": "relaylab-overview",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "timezone": "browser",
+  "time": { "from": "now-30m", "to": "now" },
+  "refresh": "10s",
+  "tags": ["relaylab", "dev"],
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "1. Publisher/consumer scrape health",
+      "description": "Answers: is Prometheus actually reaching each process? Inspect next: if red, check the process is running and its /metrics port, before trusting any other panel on this dashboard -- every other panel's data is only as fresh as this.",
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "relaylab-prometheus" },
+      "targets": [{ "expr": "up{job=~\"relaylab-.*\"}", "legendFormat": "{{job}}" }],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "value": null, "color": "red" }, { "value": 1, "color": "green" }] }
+        }
+      },
+      "options": { "textMode": "name_and_value", "colorMode": "background" }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "2. Command and consumer attempt rates by outcome",
+      "description": "Answers: is work actually progressing, and in what mix of outcomes? Inspect next: a sudden shift toward 'rejected'/'conflict'/'buffered' without a matching rise in 'committed'/'applied' suggests a fencing or ordering problem, not normal operation.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "relaylab-prometheus" },
+      "targets": [
+        { "expr": "sum by (outcome) (rate(relaylab_command_attempts_total[1m]))", "legendFormat": "command:{{outcome}}" },
+        { "expr": "sum by (outcome) (rate(relaylab_consumer_attempts_total[1m]))", "legendFormat": "consumer:{{outcome}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" } }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "3. Publish failures/retries",
+      "description": "Answers: is the publisher successfully reaching NATS? Inspect next: a sustained non-zero 'failed' rate alongside a flat 'published' rate means NATS or the publisher's network path is the actual problem, not the application logic.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "relaylab-prometheus" },
+      "targets": [
+        { "expr": "sum by (outcome) (rate(relaylab_publish_attempts_total[1m]))", "legendFormat": "{{outcome}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" } }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "4. Outbox backlog and oldest-event age",
+      "description": "Answers: is the publisher keeping up with the outbox, and for how long has the oldest row been waiting? Inspect next: a rising age with a flat/low count means one specific row is stuck (query outbox_events directly), not a volume problem. ONLY the current leader publisher exposes this -- see docs/METRICS.md.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "relaylab-prometheus" },
+      "targets": [
+        { "expr": "relaylab_outbox_unpublished_count", "legendFormat": "unpublished count" },
+        { "expr": "relaylab_outbox_oldest_unpublished_age_seconds", "legendFormat": "oldest age (s)" }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "5. Pending gaps and affected tasks",
+      "description": "Answers: how many events are durably buffered waiting on a missing predecessor, and how many distinct tasks does that affect? Inspect next: query task_consumer_state WHERE gap_detected=1 for the affected task IDs -- this panel only shows counts, never IDs (see docs/METRICS.md label discipline).",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "relaylab-prometheus" },
+      "targets": [
+        { "expr": "relaylab_pending_gap_events_count", "legendFormat": "pending gap events" },
+        { "expr": "relaylab_tasks_with_unresolved_gaps_count", "legendFormat": "tasks with gaps" }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "6. Deduplication and identity conflicts",
+      "description": "Answers: how often is redelivery happening, and is any of it a genuine identity conflict (a protocol-violation tripwire) rather than an ordinary duplicate? Inspect next: any non-zero 'conflict' rate warrants investigating consumer_event_conflicts directly -- it should not happen if the publisher is correct.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "relaylab-prometheus" },
+      "targets": [
+        { "expr": "sum(rate(relaylab_consumer_attempts_total{outcome=\"deduped\"}[1m]))", "legendFormat": "deduped" },
+        { "expr": "sum(rate(relaylab_consumer_attempts_total{outcome=\"conflict\"}[1m]))", "legendFormat": "conflict" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" } }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "7. Processing duration distributions (p50/p95)",
+      "description": "Answers: how long does command processing and consumer processing actually take? Inspect next: these are quantiles over whatever traffic this dev environment has actually seen -- do NOT read a p95 here as a measured production performance characteristic (see CLAUDE.md 'never state a performance number that was not actually measured' and docs/METRICS.md).",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "relaylab-prometheus" },
+      "targets": [
+        { "expr": "histogram_quantile(0.5, sum by (le) (rate(relaylab_command_processing_duration_seconds_bucket[5m])))", "legendFormat": "command p50" },
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(relaylab_command_processing_duration_seconds_bucket[5m])))", "legendFormat": "command p95" },
+        { "expr": "histogram_quantile(0.5, sum by (le) (rate(relaylab_consumer_processing_duration_seconds_bucket[5m])))", "legendFormat": "consumer p50" },
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(relaylab_consumer_processing_duration_seconds_bucket[5m])))", "legendFormat": "consumer p95" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "8. Quarantine state",
+      "description": "Answers: how many messages are durably dead-lettered, and what's driving new ones? Inspect next: `npm run quarantine:inspect` for the actual messages -- this panel shows counts/rates only, never payload content (see docs/OBSERVABILITY.md).",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+      "datasource": { "type": "prometheus", "uid": "relaylab-prometheus" },
+      "targets": [
+        { "expr": "relaylab_quarantined_messages_count", "legendFormat": "quarantined (total)" },
+        { "expr": "sum by (reason) (rate(relaylab_quarantine_attempts_total[5m]))", "legendFormat": "new: {{reason}}" }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "9. Durable-gauge refresh freshness",
+      "description": "Answers: can the outbox/gap/quarantine gauges above be trusted as current, or are they stale? Inspect next: if this rises above ~30s (RelaylabDurableGaugeRefreshStale's threshold) for any group, treat every gauge in panels 4/5/8 for that group as STALE, not healthy -- check that process's own logs for the refresh failure.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+      "datasource": { "type": "prometheus", "uid": "relaylab-prometheus" },
+      "targets": [
+        { "expr": "time() - relaylab_gauge_last_refresh_success_timestamp_seconds", "legendFormat": "{{group}} staleness (s)" },
+        { "expr": "increase(relaylab_gauge_refresh_failures_total[5m])", "legendFormat": "{{group}} failures (5m)" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    }
+  ]
+}

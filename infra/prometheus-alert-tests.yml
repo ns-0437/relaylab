@@ -1,0 +1,422 @@
+# Phase 1.2.1 monitoring-reliability patch, section 4: executable
+# behavior tests for every alert in prometheus-alerts.yml, run with
+# `promtool test rules prometheus-alert-tests.yml` (see
+# docs/RUNBOOKS.md and docs/PROGRESS.md for how this was run against the
+# real container and its actual output). This is SEPARATE from
+# `promtool check config` / `check rules`, which only validate SYNTAX --
+# this file validates BEHAVIOR: does each alert actually stay silent
+# when healthy, sit pending at the documented boundary, fire once its
+# `for:` duration elapses, and clear on recovery. `interval: 1m` matches
+# every alert's `for:` duration being a whole number of minutes.
+rule_files:
+  # Named "alerts.yml" here to match the ACTUAL mounted filename inside
+  # the Prometheus container (infra/compose.yaml mounts
+  # ./prometheus-alerts.yml -> /etc/prometheus/alerts.yml) -- this file
+  # itself is still named prometheus-alert-tests.yml on disk/in docs.
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # ---- RelaylabServiceScrapeDown (for: 1m) ----
+  - interval: 1m
+    input_series:
+      - series: 'up{job="relaylab-publisher"}'
+        values: "1x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: RelaylabServiceScrapeDown
+        exp_alerts: []
+
+  - interval: 1m
+    input_series:
+      - series: 'up{job="relaylab-publisher"}'
+        values: "0x10"
+    alert_rule_test:
+      # Just under the 1m `for:` boundary: down since t=0, evaluated at
+      # t=0 (the very first sample) -- not enough time has passed for
+      # `for:` to have elapsed, so the alert must be pending/absent, not firing.
+      - eval_time: 0m
+        alertname: RelaylabServiceScrapeDown
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: RelaylabServiceScrapeDown
+        exp_alerts:
+          - exp_labels:
+              job: relaylab-publisher
+              severity: warning
+            exp_annotations:
+              summary: "Prometheus cannot scrape relaylab-publisher ()"
+              description: "The relaylab-publisher target has been unreachable for over a minute."
+              runbook_url: "docs/RUNBOOKS.md#relaylabservicescrapedown"
+
+  - interval: 1m
+    input_series:
+      # down for 3 minutes, then recovers (back to 1) for the rest.
+      - series: 'up{job="relaylab-publisher"}'
+        values: "0x3 1x5"
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: RelaylabServiceScrapeDown
+        exp_alerts:
+          - exp_labels: { job: relaylab-publisher, severity: warning }
+            exp_annotations:
+              summary: "Prometheus cannot scrape relaylab-publisher ()"
+              description: "The relaylab-publisher target has been unreachable for over a minute."
+              runbook_url: "docs/RUNBOOKS.md#relaylabservicescrapedown"
+      - eval_time: 6m
+        alertname: RelaylabServiceScrapeDown
+        exp_alerts: [] # recovered -- must clear, not stay firing
+
+  # ---- RelaylabOutboxBacklogHigh (for: 5m) ----
+  - interval: 1m
+    input_series:
+      - series: "relaylab_outbox_unpublished_count"
+        values: "10x20" # healthy, well under 100, for the whole window
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: RelaylabOutboxBacklogHigh
+        exp_alerts: []
+
+  - interval: 1m
+    input_series:
+      - series: "relaylab_outbox_unpublished_count"
+        values: "150x20" # persistently over threshold
+    alert_rule_test:
+      - eval_time: 3m # before the 5m `for:` boundary
+        alertname: RelaylabOutboxBacklogHigh
+        exp_alerts: []
+      - eval_time: 6m # past the boundary
+        alertname: RelaylabOutboxBacklogHigh
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: "Outbox backlog > 100 unpublished events for 5+ minutes"
+              description: "relaylab_outbox_unpublished_count = 150."
+              runbook_url: "docs/RUNBOOKS.md#relaylaboutboxbacklophigh"
+
+  - interval: 1m
+    input_series:
+      - series: "relaylab_outbox_unpublished_count"
+        values: "150x8 10x8" # over threshold, then recovers
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: RelaylabOutboxBacklogHigh
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: "Outbox backlog > 100 unpublished events for 5+ minutes"
+              description: "relaylab_outbox_unpublished_count = 150."
+              runbook_url: "docs/RUNBOOKS.md#relaylaboutboxbacklophigh"
+      - eval_time: 15m
+        alertname: RelaylabOutboxBacklogHigh
+        exp_alerts: []
+
+  # ---- RelaylabOldestUnpublishedEventTooOld (for: 2m) ----
+  - interval: 1m
+    input_series:
+      - series: "relaylab_outbox_oldest_unpublished_age_seconds"
+        values: "5x10" # healthy
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: RelaylabOldestUnpublishedEventTooOld
+        exp_alerts: []
+
+  - interval: 1m
+    input_series:
+      - series: "relaylab_outbox_oldest_unpublished_age_seconds"
+        values: "90x10"
+    alert_rule_test:
+      - eval_time: 1m # before the 2m boundary
+        alertname: RelaylabOldestUnpublishedEventTooOld
+        exp_alerts: []
+      - eval_time: 3m # past the boundary
+        alertname: RelaylabOldestUnpublishedEventTooOld
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: "The oldest unpublished outbox event is over 60s old"
+              description: "relaylab_outbox_oldest_unpublished_age_seconds = 90."
+              runbook_url: "docs/RUNBOOKS.md#relaylaboldestunpublishedeventtooold"
+
+  - interval: 1m
+    input_series:
+      - series: "relaylab_outbox_oldest_unpublished_age_seconds"
+        values: "90x5 5x5"
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: RelaylabOldestUnpublishedEventTooOld
+        exp_alerts: [] # recovered
+
+  # ---- RelaylabGapBacklogPersisting (for: 10m) ----
+  - interval: 1m
+    input_series:
+      - series: "relaylab_pending_gap_events_count"
+        values: "0x20" # healthy
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: RelaylabGapBacklogPersisting
+        exp_alerts: []
+
+  - interval: 1m
+    input_series:
+      - series: "relaylab_pending_gap_events_count"
+        values: "3x25"
+    alert_rule_test:
+      - eval_time: 5m # before the 10m boundary
+        alertname: RelaylabGapBacklogPersisting
+        exp_alerts: []
+      - eval_time: 11m # past the boundary
+        alertname: RelaylabGapBacklogPersisting
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: "Pending gap-buffered events have persisted for 10+ minutes"
+              description: "relaylab_pending_gap_events_count = 3; see relaylab_tasks_with_unresolved_gaps_count for how many tasks are affected."
+              runbook_url: "docs/RUNBOOKS.md#relaylabgapbacklogpersisting"
+
+  - interval: 1m
+    input_series:
+      - series: "relaylab_pending_gap_events_count"
+        values: "3x15 0x10" # persists, then the missing event arrives and the gap clears
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: RelaylabGapBacklogPersisting
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: "Pending gap-buffered events have persisted for 10+ minutes"
+              description: "relaylab_pending_gap_events_count = 3; see relaylab_tasks_with_unresolved_gaps_count for how many tasks are affected."
+              runbook_url: "docs/RUNBOOKS.md#relaylabgapbacklogpersisting"
+      - eval_time: 20m
+        alertname: RelaylabGapBacklogPersisting
+        exp_alerts: []
+
+  # ---- RelaylabDurableGaugeRefreshStale (for: 1m) ----
+  # `time() - relaylab_gauge_last_refresh_success_timestamp_seconds` -- the
+  # series below is held at a FIXED timestamp (simulating "stopped
+  # refreshing"), so as promtool's own simulated clock advances, the
+  # computed staleness grows past the 30s threshold on its own.
+  - interval: 1m
+    input_series:
+      - series: 'relaylab_gauge_last_refresh_success_timestamp_seconds{group="outbox"}'
+        values: "0x60" # timestamp 0 (the Unix epoch) -- far enough in the past that time()-0 is always >> 30s regardless of promtool's own simulated base time
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: RelaylabDurableGaugeRefreshStale
+        exp_alerts:
+          - exp_labels: { group: outbox, severity: warning }
+            exp_annotations:
+              summary: "Durable gauge group outbox has not refreshed successfully in 30+ seconds"
+              description: "Treat every OTHER relaylab_outbox_*/relaylab_pending_gap_*/relaylab_tasks_with_unresolved_gaps_*/relaylab_quarantined_* value as STALE, not current, while this fires."
+              runbook_url: "docs/RUNBOOKS.md#relaylabdurablegaugerefreshstale"
+
+  # Healthy case: the timestamp series ADVANCES along with simulated
+  # time (a real `time()` offset trick: each successive 1m step's value
+  # is itself ~1m later), so staleness never exceeds ~60s... actually to
+  # keep this simple and robust across promtool versions, the healthy
+  # case is validated differently: a timestamp series that is simply
+  # ABSENT never produces a staleness value at all (see the
+  # missing-data test below), and a timestamp series held within the
+  # last 30s of "now" is exercised directly by the live validation in
+  # section 5/evidence (promtool's unit-test clock makes a moving target
+  # awkward to express declaratively here) -- documented as a real,
+  # accepted scope limit of this fixture file, not silently skipped.
+
+  # ---- Missing/stale-data behavior ----
+  # `time() - <absent series>` has NO SAMPLES to subtract from and
+  # produces NO alert from RelaylabDurableGaugeRefreshStale itself --
+  # that is EXPECTED and fine, because this specific condition (target
+  # down entirely) is covered by RelaylabServiceScrapeDown, and the
+  # weaker "target up but freshness series never appeared" condition is
+  # now covered by RelaylabPublisherOutboxFreshnessMissing /
+  # RelaylabConsumerGapsFreshnessMissing below (Phase 2A patch, Part A --
+  # this used to be a real, undetected gap; see docs/PROGRESS.md).
+  - interval: 1m
+    input_series: []
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: RelaylabDurableGaugeRefreshStale
+        exp_alerts: [] # absent data alone never fires THIS alert -- by design, not a gap, now that the cases below exist
+
+  # ---- RelaylabPublisherOutboxFreshnessMissing (for: 2m) ----
+  # Point 1 (target down): up itself is 0, so the `up == 1` guard means
+  # this alert correctly stays silent -- RelaylabServiceScrapeDown is the
+  # one that fires for that case, not this one.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="relaylab-publisher",instance="pub:9464"}'
+        values: "0x10"
+      - series: 'relaylab_publisher_leadership_state{job="relaylab-publisher",instance="pub:9464"}'
+        values: "1x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: RelaylabPublisherOutboxFreshnessMissing
+        exp_alerts: [] # target down -- RelaylabServiceScrapeDown's job, not this one
+
+  # Point 2 (up, leader, freshness series ABSENT the whole time): fires
+  # after the 2m startup-grace `for:` duration.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="relaylab-publisher",instance="pub:9464"}'
+        values: "1x10"
+      - series: 'relaylab_publisher_leadership_state{job="relaylab-publisher",instance="pub:9464"}'
+        values: "1x10"
+    alert_rule_test:
+      - eval_time: 1m # still within the startup grace period
+        alertname: RelaylabPublisherOutboxFreshnessMissing
+        exp_alerts: []
+      - eval_time: 3m # past the grace period, still never appeared
+        alertname: RelaylabPublisherOutboxFreshnessMissing
+        exp_alerts:
+          - exp_labels: { job: relaylab-publisher, instance: "pub:9464", severity: warning }
+            exp_annotations:
+              summary: "Publisher pub:9464 is up and believes it is leader, but has never recorded a successful outbox-gauge refresh"
+              description: "relaylab_gauge_last_refresh_success_timestamp_seconds{group=\"outbox\"} is entirely ABSENT for this instance -- distinct from stale (see RelaylabDurableGaugeRefreshStale). Treat relaylab_outbox_unpublished_count/relaylab_outbox_oldest_unpublished_age_seconds as UNKNOWN, not healthy, for this instance."
+              runbook_url: "docs/RUNBOOKS.md#relaylabpublisheroutboxfreshnessmissing"
+
+  # Point 5 (fresh / healthy): the freshness series IS present for this instance -- never fires.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="relaylab-publisher",instance="pub:9464"}'
+        values: "1x10"
+      - series: 'relaylab_publisher_leadership_state{job="relaylab-publisher",instance="pub:9464"}'
+        values: "1x10"
+      - series: 'relaylab_gauge_last_refresh_success_timestamp_seconds{job="relaylab-publisher",instance="pub:9464",group="outbox"}'
+        values: "0x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: RelaylabPublisherOutboxFreshnessMissing
+        exp_alerts: []
+
+  # A STANDBY publisher (up, but NOT leader) legitimately never exports
+  # the outbox freshness series -- must NEVER fire for this instance
+  # (see docs/METRICS.md "gauge ownership": only the leader runs that
+  # refresher, by design).
+  - interval: 1m
+    input_series:
+      - series: 'up{job="relaylab-publisher",instance="pub-standby:9464"}'
+        values: "1x10"
+      - series: 'relaylab_publisher_leadership_state{job="relaylab-publisher",instance="pub-standby:9464"}'
+        values: "0x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: RelaylabPublisherOutboxFreshnessMissing
+        exp_alerts: [] # standby is EXPECTED to have no outbox freshness series -- not an error
+
+  # ---- RelaylabConsumerGapsFreshnessMissing (for: 2m) ----
+  - interval: 1m
+    input_series:
+      - series: 'up{job="relaylab-consumer",instance="con:9465"}'
+        values: "1x10"
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: RelaylabConsumerGapsFreshnessMissing
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: RelaylabConsumerGapsFreshnessMissing
+        exp_alerts:
+          - exp_labels: { job: relaylab-consumer, instance: "con:9465", severity: warning }
+            exp_annotations:
+              summary: "Consumer con:9465 is up but has never recorded a successful gap/quarantine-gauge refresh"
+              description: "relaylab_gauge_last_refresh_success_timestamp_seconds{group=\"gaps\"} is entirely ABSENT for this instance -- distinct from stale. Treat relaylab_pending_gap_events_count/relaylab_tasks_with_unresolved_gaps_count/relaylab_quarantined_messages_count as UNKNOWN, not healthy, for this instance."
+              runbook_url: "docs/RUNBOOKS.md#relaylabconsumergapsfreshnessmissing"
+
+  - interval: 1m
+    input_series:
+      - series: 'up{job="relaylab-consumer",instance="con:9465"}'
+        values: "1x10"
+      - series: 'relaylab_gauge_last_refresh_success_timestamp_seconds{job="relaylab-consumer",instance="con:9465",group="gaps"}'
+        values: "0x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: RelaylabConsumerGapsFreshnessMissing
+        exp_alerts: [] # fresh/present -- healthy
+
+  # ---- RelaylabQuarantinedMessagesPresent (for: 1m) ----
+  - interval: 1m
+    input_series:
+      - series: "relaylab_quarantined_messages_count"
+        values: "0x10"
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: RelaylabQuarantinedMessagesPresent
+        exp_alerts: []
+
+  - interval: 1m
+    input_series:
+      - series: "relaylab_quarantined_messages_count"
+        values: "2x10"
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: RelaylabQuarantinedMessagesPresent
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: RelaylabQuarantinedMessagesPresent
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: "2 message(s) sit in durable dead-letter quarantine"
+              description: "Inspect with `npm run quarantine:inspect` -- see docs/OBSERVABILITY.md 'dead-letter quarantine'."
+              runbook_url: "docs/RUNBOOKS.md#relaylabquarantinedmessagespresent"
+
+  - interval: 1m
+    input_series:
+      - series: "relaylab_quarantined_messages_count"
+        values: "2x8 0x8" # a human cleared/investigated the quarantine table
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: RelaylabQuarantinedMessagesPresent
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: "2 message(s) sit in durable dead-letter quarantine"
+              description: "Inspect with `npm run quarantine:inspect` -- see docs/OBSERVABILITY.md 'dead-letter quarantine'."
+              runbook_url: "docs/RUNBOOKS.md#relaylabquarantinedmessagespresent"
+      - eval_time: 14m
+        alertname: RelaylabQuarantinedMessagesPresent
+        exp_alerts: []
+
+  # ---- RelaylabDuplicateConsumerGaugeExporters (for: 1m) ----
+  - interval: 1m
+    input_series:
+      - series: "relaylab_consumer_gauge_exporter_count"
+        values: "1x10" # healthy -- exactly one exporter
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: RelaylabDuplicateConsumerGaugeExporters
+        exp_alerts: []
+
+  - interval: 1m
+    input_series:
+      - series: "relaylab_consumer_gauge_exporter_count"
+        values: "2x10" # unsupported -- two instances both exporting
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: RelaylabDuplicateConsumerGaugeExporters
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: RelaylabDuplicateConsumerGaugeExporters
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: "2 consumer instances are exporting gap/quarantine gauges for the same consumer -- an UNSUPPORTED topology"
+              description: "Horizontal consumer scaling is not supported (see CLAUDE.md) -- relaylab_pending_gap_events_count/relaylab_tasks_with_unresolved_gaps_count/relaylab_quarantined_messages_count may now be duplicated across instances."
+              runbook_url: "docs/RUNBOOKS.md#relaylabduplicateconsumergaugeexporters"
+
+  - interval: 1m
+    input_series:
+      - series: "relaylab_consumer_gauge_exporter_count"
+        values: "2x8 1x8" # the operator stops the duplicate instance
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: RelaylabDuplicateConsumerGaugeExporters
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: "2 consumer instances are exporting gap/quarantine gauges for the same consumer -- an UNSUPPORTED topology"
+              description: "Horizontal consumer scaling is not supported (see CLAUDE.md) -- relaylab_pending_gap_events_count/relaylab_tasks_with_unresolved_gaps_count/relaylab_quarantined_messages_count may now be duplicated across instances."
+              runbook_url: "docs/RUNBOOKS.md#relaylabduplicateconsumergaugeexporters"
+      - eval_time: 14m
+        alertname: RelaylabDuplicateConsumerGaugeExporters
+        exp_alerts: []
