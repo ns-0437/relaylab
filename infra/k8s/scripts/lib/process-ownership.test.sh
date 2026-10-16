@@ -18,6 +18,15 @@ FAIL=0
 
 # shellcheck source=./process-ownership.sh
 source "$HERE/process-ownership.sh"
+# process-ownership.sh sets -euo pipefail at its own top -- sourcing it
+# applies that to THIS shell too, silently overriding this file's own
+# deliberate `set -uo pipefail` (no -e) above and making any unexpected
+# nonzero return abort the WHOLE test run instead of just failing one
+# test (found directly: a transient po_start hiccup under this exact
+# bug took down the rest of the suite with no "NOT OK" ever printed for
+# it). Restoring `set +e` here, after sourcing, keeps -u/pipefail active
+# while giving this file back its own intended fault tolerance.
+set +e
 
 pass() { PASS=$((PASS + 1)); echo "ok - $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "NOT OK - $1"; }
@@ -25,12 +34,22 @@ fail() { FAIL=$((FAIL + 1)); echo "NOT OK - $1"; }
 # A long-running, harmless, uniquely-markable fixture -- never a real
 # user process. $1 is a unique marker string baked into the fixture's
 # own `node -e` source, so its command line is independently verifiable.
+# Retries ONCE on a start failure -- rapid back-to-back fixture churn
+# (several of these in one test run) was observed to occasionally trip
+# po_start's 500ms settle window transiently under host load; a single
+# retry absorbs that without masking a REAL, reproducible failure (which
+# would fail twice in a row).
 start_fixture() {
   local marker="$1"
   local record="$TMP_DIR/record-$marker"
-  po_start "$record" "$TMP_DIR/out-$marker.log" "$TMP_DIR/err-$marker.log" \
+  if ! po_start "$record" "$TMP_DIR/out-$marker.log" "$TMP_DIR/err-$marker.log" \
     "node" "-e \"/* fixture:$marker */ setInterval(()=>{}, 100000)\"" "fixture:$marker" \
-    >"$TMP_DIR/po-start-$marker.log" 2>&1
+    >"$TMP_DIR/po-start-$marker.log" 2>&1; then
+    sleep 1
+    po_start "$record" "$TMP_DIR/out-$marker.log" "$TMP_DIR/err-$marker.log" \
+      "node" "-e \"/* fixture:$marker */ setInterval(()=>{}, 100000)\"" "fixture:$marker" \
+      >>"$TMP_DIR/po-start-$marker.log" 2>&1
+  fi
   echo "$record"
 }
 
@@ -114,7 +133,7 @@ test_stale_record_unrelated_process() {
       fail "test2: po_stop refused as expected, but the unrelated bystander process is somehow gone anyway"
     fi
   fi
-  grep -qi "REUSED" "$PO_RECOVERY_LOG" 2>/dev/null && pass "test2b: the mismatch was recorded in the recovery log" || fail "test2b: no recovery-log entry was written for the refused stop"
+  grep -qi "reuse" "$PO_RECOVERY_LOG" 2>/dev/null && pass "test2b: the mismatch was recorded in the recovery log" || fail "test2b: no recovery-log entry was written for the refused stop"
 
   cleanup_pid "$bystander_pid"
   kill "$bash_bg" 2>/dev/null || true
@@ -197,11 +216,159 @@ test_ambiguous_identity_is_visible() {
   fi
 }
 
+# --- Test 6: an executable-path/command-line mismatch (creation time
+# UNCHANGED) is refused just as a creation-time mismatch is -- a
+# different identity dimension than test2. ---
+test_exe_and_command_mismatch() {
+  local name="t6-$$"
+  local record
+  record="$(start_fixture "$name")"
+  local pid
+  pid="$(grep '^PID=' "$record" 2>/dev/null | cut -d= -f2-)"
+  if [ -z "$pid" ]; then fail "test6: fixture failed to start"; return; fi
+
+  # Tamper with ONLY the EXE/MARKER fields, leaving CREATED (and the
+  # real pid) exactly as recorded -- isolates this check from test2's
+  # creation-time dimension.
+  local created
+  created="$(grep '^CREATED=' "$record" | cut -d= -f2-)"
+  {
+    echo "PID=$pid"
+    echo "CREATED=$created"
+    echo "EXE=C:\\this\\does\\not\\match\\node.exe"
+    echo "MARKER=this-marker-does-not-appear-in-the-real-command-line"
+  } > "$record"
+
+  if po_stop "$record" >"$TMP_DIR/po-stop-$name.log" 2>&1; then
+    fail "test6: po_stop reported SUCCESS despite an exe/command-line mismatch"
+    cleanup_pid "$pid"
+  else
+    if fixture_pid_alive "$record" 2>/dev/null || powershell.exe -NoProfile -Command "if (Get-Process -Id $pid -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }" >/dev/null 2>&1; then
+      pass "test6: an exe/command-line mismatch (creation time unchanged) is refused -- the real process survives untouched"
+    else
+      fail "test6: po_stop refused as expected, but the process is gone anyway"
+    fi
+    cleanup_pid "$pid"
+  fi
+}
+
+# --- Test 7: an EMPTY marker field is rejected before any termination attempt. ---
+test_empty_marker_rejected() {
+  local name="t7-$$"
+  local record
+  record="$(start_fixture "$name")"
+  local pid created exe
+  pid="$(grep '^PID=' "$record" | cut -d= -f2-)"
+  created="$(grep '^CREATED=' "$record" | cut -d= -f2-)"
+  exe="$(grep '^EXE=' "$record" | cut -d= -f2-)"
+  {
+    echo "PID=$pid"
+    echo "CREATED=$created"
+    echo "EXE=$exe"
+    echo "MARKER="
+  } > "$record"
+
+  if po_stop "$record" >"$TMP_DIR/po-stop-$name.log" 2>&1; then
+    fail "test7: po_stop reported SUCCESS with an EMPTY marker field"
+    cleanup_pid "$pid"
+  else
+    pass "test7: an empty marker field is rejected outright, before any termination attempt"
+    cleanup_pid "$pid"
+  fi
+}
+
+# --- Test 8: an identity-query FAILURE (distinct from confirmed absence)
+# retains the record and reports failure -- never ALREADY_GONE/STOPPED. ---
+test_query_failure_retains_record() {
+  local name="t8-$$"
+  local record
+  record="$(start_fixture "$name")"
+  local pid
+  pid="$(grep '^PID=' "$record" | cut -d= -f2-)"
+  if [ -z "$pid" ]; then fail "test8: fixture failed to start"; return; fi
+
+  # Controlled injection: a genuine WMI query failure for a REAL, still
+  # alive process is not reliably reproducible from a test without
+  # tampering with the host. Instead, this directly exercises the bash
+  # layer's handling of that outcome by substituting a stand-in for
+  # _po_run_ps1 that returns exactly what process-ownership.ps1 itself
+  # would return on a query failure -- never targeting a real process,
+  # never claiming the PowerShell layer was itself exercised by this
+  # specific test (see process-ownership.ps1's own `stop` action, and
+  # test1/test6 above, for that).
+  _po_run_ps1() { echo "QUERY_FAILED:simulated WMI failure for this test"; }
+  if po_stop "$record" >"$TMP_DIR/po-stop-$name.log" 2>&1; then
+    fail "test8: po_stop reported SUCCESS on a simulated query failure -- it must never treat inspection failure as ALREADY_GONE or STOPPED"
+  else
+    if [ -f "$record" ]; then
+      pass "test8: a query failure retains the record and reports failure, distinct from confirmed absence"
+    else
+      fail "test8: po_stop reported failure (correct) but removed the record anyway (incorrect -- only a confirmed outcome should remove it)"
+    fi
+  fi
+  # `unset -f` only DELETES the override -- it does not restore the
+  # original definition from process-ownership.sh (bash functions are
+  # not layered/stacked). Re-sourcing the real file is what actually
+  # puts the genuine _po_run_ps1 back; this was found directly here --
+  # without it, every test after this one silently lost _po_run_ps1
+  # entirely, making po_start/po_stop fail with no function defined.
+  unset -f _po_run_ps1
+  source "$HERE/process-ownership.sh"
+  set +e
+  grep -qi "inspection failure\|QUERY_FAILED" "$PO_RECOVERY_LOG" 2>/dev/null && pass "test8b: the query failure was recorded in the recovery log" || fail "test8b: no recovery-log entry was written for the query failure"
+  cleanup_pid "$pid"
+}
+
+# --- Test 9: an identity change simulated BETWEEN an earlier check and
+# the final termination boundary is refused -- the boundary itself must
+# re-validate, not trust a prior conclusion. ---
+test_identity_change_between_check_and_termination() {
+  local name="t9-$$"
+  local record
+  record="$(start_fixture "$name")"
+  local pid
+  pid="$(grep '^PID=' "$record" 2>/dev/null | cut -d= -f2-)"
+  if [ -z "$pid" ]; then fail "test9: fixture failed to start"; return; fi
+
+  # At this point the record is CORRECT -- exactly what an earlier
+  # caller's own check would have seen and approved. Simulate reality
+  # having changed by the time termination actually runs (the real
+  # shape of a PID-reuse race) by rewriting the record's CREATED field
+  # to a value that no longer matches the still-running real process --
+  # the termination boundary must catch THIS, independent of whatever
+  # an earlier check believed.
+  local exe marker
+  exe="$(grep '^EXE=' "$record" | cut -d= -f2-)"
+  marker="$(grep '^MARKER=' "$record" | cut -d= -f2-)"
+  {
+    echo "PID=$pid"
+    echo "CREATED=2000-01-01T00:00:00.0000000+05:30"
+    echo "EXE=$exe"
+    echo "MARKER=$marker"
+  } > "$record"
+
+  if po_stop "$record" >"$TMP_DIR/po-stop-$name.log" 2>&1; then
+    fail "test9: po_stop reported SUCCESS despite the identity having changed since the record was established"
+    cleanup_pid "$pid"
+  else
+    if powershell.exe -NoProfile -Command "if (Get-Process -Id $pid -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }" >/dev/null 2>&1; then
+      pass "test9: an identity change between an earlier check and the termination boundary is refused -- the real process survives untouched"
+    else
+      fail "test9: po_stop refused as expected, but the process is gone anyway"
+    fi
+    cleanup_pid "$pid"
+  fi
+}
+
 test_start_then_stop
 test_stale_record_unrelated_process
 test_unrelated_listener_survives
 test_already_exited
 test_ambiguous_identity_is_visible
+test_exe_and_command_mismatch
+test_empty_marker_rejected
+test_query_failure_retains_record
+test_identity_change_between_check_and_termination
 
 echo "---"
 echo "tests passed: $PASS, failed: $FAIL"

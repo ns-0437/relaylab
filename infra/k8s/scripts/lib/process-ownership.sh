@@ -147,14 +147,30 @@ po_start() {
   esac
 }
 
-# Stops the process recorded in $record_file, but ONLY after confirming
-# its CURRENT identity still matches what was recorded (creation
-# timestamp, exact) and that its CURRENT command line still contains the
-# recorded marker. If the recorded pid is already gone, this is a
-# (logged) success -- nothing to do. If identity cannot be confirmed, or
-# termination is not confirmed within the bound, this LEAVES THE PROCESS
-# RUNNING, appends to the recovery log, and returns failure; it never
-# reports success for something it could not verify.
+# Phase 3A.2 corrective patch: this used to run a SEPARATE
+# `-Action identity` call in bash, decide here whether it looked safe,
+# and only THEN call a SEPARATE `-Action stop -ProcessId X` call that
+# received nothing but the bare PID -- a real gap, not just a cosmetic
+# one: between those two calls, the PID could be reused, and
+# Stop-Process -Id (which re-resolves the PID at the moment IT runs)
+# would have no way to know. Moving the SAME check to run immediately
+# before Stop-Process -Id would not have closed this either -- the
+# re-resolution is what's unsafe, not merely the check's timing.
+#
+# The fix: the expected identity is now passed DIRECTLY into ONE
+# `-Action stop` call, which performs its OWN validation at the actual
+# termination boundary (see process-ownership.ps1's `stop` action for
+# the full design: a stable .NET process handle obtained via
+# GetProcessById, validated, and terminated via THAT handle's own
+# Kill() -- never a second, unguarded PID resolution).
+#
+# Stops the process recorded in $record_file. If the recorded pid is
+# already confirmed gone, this is a (logged) success. If identity
+# cannot be established (mismatch OR a genuine inspection/query
+# failure, which is NEVER treated as either ALREADY_GONE or STOPPED),
+# or termination is not confirmed within the bound, this LEAVES THE
+# PROCESS RUNNING, appends to the recovery log, and returns failure --
+# it never reports success for something it could not verify.
 po_stop() {
   local record_file="$1"
   if [ ! -f "$record_file" ]; then
@@ -167,55 +183,43 @@ po_stop() {
   recorded_created="$(grep '^CREATED=' "$record_file" | cut -d= -f2-)"
   recorded_exe="$(grep '^EXE=' "$record_file" | cut -d= -f2-)"
   recorded_marker="$(grep '^MARKER=' "$record_file" | cut -d= -f2-)"
-  if [ -z "$recorded_pid" ]; then
-    _po_fail "record file $record_file is malformed (no PID= line) -- refusing to act on it"
+  # Reject missing/empty/malformed identity fields BEFORE ever calling
+  # into the termination boundary -- this is this layer's OWN check,
+  # redundant with (not a substitute for) the ps1 script's identical
+  # refusal.
+  if [ -z "$recorded_pid" ] || [ -z "$recorded_created" ] || [ -z "$recorded_exe" ] || [ -z "$recorded_marker" ]; then
+    _po_fail "record file $record_file is malformed or incomplete (PID/CREATED/EXE/MARKER must all be present and non-empty) -- refusing to act on it"
     return 1
   fi
 
   local result
-  result="$(_po_run_ps1 -Action identity -ProcessId "$recorded_pid")"
-
-  if [ "$result" = "NOTFOUND" ]; then
-    _po_log "pid $recorded_pid already exited -- nothing to stop (treated as success)."
-    rm -f "$record_file"
-    return 0
-  fi
-
-  local cur_pid cur_created cur_exe cur_cmdline
-  case "$result" in
-    OK:*) IFS='|' read -r cur_pid cur_created cur_exe cur_cmdline <<< "${result#OK:}" ;;
-    *)
-      _po_record_recovery "could not read current identity for recorded pid=$recorded_pid (unexpected response: $result) -- LEFT RUNNING, not killed" "$record_file"
-      _po_fail "could not confirm pid $recorded_pid's current identity -- leaving it running. See $PO_RECOVERY_LOG."
-      return 1
-      ;;
-  esac
-
-  if [ "$cur_created" != "$recorded_created" ]; then
-    _po_record_recovery "pid=$recorded_pid creation time changed (recorded=$recorded_created now=$cur_created) -- this PID has been REUSED by a different process. LEFT RUNNING, not killed." "$record_file"
-    _po_fail "pid $recorded_pid's creation time no longer matches what was recorded -- this is a DIFFERENT process now (PID reuse). Leaving it running. See $PO_RECOVERY_LOG."
-    return 1
-  fi
-  case "$cur_cmdline" in
-    *"$recorded_marker"*) ;;
-    *)
-      _po_record_recovery "pid=$recorded_pid creation time still matches but its command line no longer contains the recorded marker '$recorded_marker' -- LEFT RUNNING, not killed." "$record_file"
-      _po_fail "pid $recorded_pid no longer looks like the process we started (command line mismatch) -- leaving it running. See $PO_RECOVERY_LOG."
-      return 1
-      ;;
-  esac
-
-  _po_log "identity confirmed for pid $recorded_pid (creation time + command line both match) -- terminating."
-  result="$(_po_run_ps1 -Action stop -ProcessId "$recorded_pid" -TimeoutMs 3000)"
+  result="$(_po_run_ps1 -Action stop -ProcessId "$recorded_pid" \
+    -ExpectedCreated "$recorded_created" -ExpectedExe "$recorded_exe" -ExpectedMarker "$recorded_marker" \
+    -TimeoutMs 3000)"
 
   case "$result" in
-    ALREADY_GONE|STOPPED)
-      _po_log "pid $recorded_pid terminated and confirmed gone."
+    ALREADY_GONE)
+      _po_log "pid $recorded_pid was already confirmed gone -- nothing to stop (treated as success)."
       rm -f "$record_file"
       return 0
       ;;
+    STOPPED)
+      _po_log "identity confirmed for pid $recorded_pid at the termination boundary -- stopped and confirmed gone."
+      rm -f "$record_file"
+      return 0
+      ;;
+    IDENTITY_MISMATCH:*)
+      _po_record_recovery "pid=$recorded_pid: identity mismatch at the termination boundary (${result#IDENTITY_MISMATCH:}) -- this PID no longer identifies the process we started (likely PID reuse). LEFT RUNNING, not killed." "$record_file"
+      _po_fail "pid $recorded_pid's identity no longer matches what was recorded -- leaving it running. See $PO_RECOVERY_LOG."
+      return 1
+      ;;
+    QUERY_FAILED:*)
+      _po_record_recovery "pid=$recorded_pid: identity/liveness query failed immediately before termination (${result#QUERY_FAILED:}) -- an INSPECTION FAILURE, not confirmed absence. LEFT RUNNING, not killed." "$record_file"
+      _po_fail "could not confirm pid $recorded_pid's identity at the termination boundary (inspection failure, not confirmed absence) -- leaving it running. See $PO_RECOVERY_LOG."
+      return 1
+      ;;
     STILL_RUNNING)
-      _po_record_recovery "pid=$recorded_pid: termination was issued but NOT confirmed within the bound -- may still be running." "$record_file"
+      _po_record_recovery "pid=$recorded_pid: identity confirmed and termination was issued, but NOT confirmed within the bound -- may still be running." "$record_file"
       _po_fail "termination of pid $recorded_pid was issued but could not be confirmed within the timeout -- treat as NOT stopped. See $PO_RECOVERY_LOG."
       return 1
       ;;
