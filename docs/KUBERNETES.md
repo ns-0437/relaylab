@@ -88,9 +88,12 @@ double-apply an `event_id` even before this patch -- MySQL's row lock
 serializes the second transaction behind the first, and the gap-buffer
 logic (`task_consumer_pending`) correctly absorbs out-of-order delivery
 either way. **This patch is not fixing a data-corruption bug that
-doesn't exist; it is removing wasted/competing work and giving an
-explicit, provable "exactly one active" guarantee**, per this patch's
-explicit instruction to enforce the supported lifecycle regardless.
+doesn't exist; it is removing wasted/competing work in the NORMAL
+case.** See "Consumer exclusivity: what the lease actually guarantees"
+below -- Phase 3A.2 corrected an overclaim here: this lock does NOT
+provide a universal "exactly one active process at every instant"
+guarantee. It coordinates normal polling; it does not fence an
+in-flight operation that outlives its own lease.
 
 The fix reuses the SMALLEST existing mechanism: `src/messaging/
 publisher-lock.ts`'s one function was already generic (parameterized by
@@ -108,7 +111,59 @@ relaylab-consumer --replicas=2` on the live cluster. Both pods reached
 pod's log ever showed `acquired the consumer exclusivity lock`; a
 command seeded while both ran was processed exactly once, by the lock
 holder, with the standby pod's log showing zero further lines. See
-evidence/phase1-evidence.md section C for the full transcript.
+evidence/phase1-evidence.md section C for the full transcript. **That
+test proves the lock is uncontended and effective in the HEALTHY,
+NORMAL case -- both pods started cleanly and polled normally. It does
+NOT prove strict exclusion after a lease expires mid-operation**; see
+the next section for the guarantee that is actually implemented and
+proven.
+
+### Consumer exclusivity: what the lease actually guarantees (Phase 3A.2)
+
+Inspected the complete acquire -> process -> renew path in
+`consumer-main.ts` directly, rather than assuming the 2-replica test
+above was the whole story. Found: `tryAcquireOrRenewExclusiveLock` is
+awaited ONCE per poll iteration, strictly BEFORE `processBatch` is
+called -- its returned `epoch` is never passed into `processBatch`, and
+`processBatch`'s own duration has no bound tied to
+`CONSUMER_LOCK_LEASE_MS` (3000ms). Concretely, this means:
+
+- **What the lease DOES do**: gates whether a NEW iteration starts.
+  An instance that fails to acquire/renew the lock skips calling
+  `processBatch` entirely for that iteration. This is what makes the
+  2-replica test above show a clean standby that never processes
+  anything, and what stops two instances from routinely competing for
+  work in the ordinary case.
+- **What the lease does NOT do**: bound or cancel a `processBatch` call
+  already in flight. If one call happens to run longer than the lease
+  (a slow NATS fetch, slow DB work, a GC pause), the lease can expire
+  while that call is still running -- at which point a DIFFERENT
+  instance's own acquire call can legitimately succeed and it can start
+  its OWN `processBatch` call, genuinely overlapping the first.
+- **Do not describe this as "exactly one active process at every
+  instant."** It is not. The actual, narrower, correctly-scoped claim
+  is: the lease coordinates normal polling cadence; it does not fence
+  an already-authorized in-flight operation.
+
+**What actually protects durable correctness under that overlap**:
+`consumer.ts`'s own transactional row locking
+(`SELECT ... FOR UPDATE` on both `consumer_processed` and
+`task_consumer_state`, inside one transaction per event via
+`applyEventWithDedup`) -- not the lease. Proven deterministically in
+`tests/integration/consumer-lease-overlap.test.ts`: two calls to
+`applyEventWithDedup` for the exact same event, issued via
+`Promise.all` (genuinely concurrent, not sequential), still produce
+exactly ONE durable application (`event_count` stays `1`, one
+`consumer_processed` row, outcomes `["applied", "deduped"]`) -- the
+database's own row lock serializes the second caller behind the first
+regardless of which "lock holder" either caller believed itself to be.
+This is the precise distinction this milestone draws: overlapping
+EXECUTION (two calls running at once) is not the same thing as a
+duplicate durable EFFECT (which does not happen here). No new
+distributed-lock design was introduced to CLOSE this gap -- inspection
+showed the existing transactional design already protects the durable
+effects that matter; what changed is the documentation accurately
+describing the lease's real scope instead of overclaiming it.
 
 ### Two local stacks can coexist on this host
 
@@ -232,6 +287,11 @@ infra/k8s/scripts/stop-port-forwards.sh
 # Manual inspection:
 export KUBECONFIG=infra/k8s/.kubeconfig
 kubectl --context kind-relaylab-local --namespace relaylab get pods
+
+# Phase 3A.2 verification (standalone, no cluster required):
+bash infra/k8s/scripts/lib/process-ownership.test.sh    # 6 tests, isolated fixture process
+npm run demo:fresh-schema                                 # disposable database, migrations + representative ops
+node --import tsx --test tests/integration/consumer-lease-overlap.test.ts
 
 # Separate, explicit, NEVER automatic -- deletes the cluster and all PV data:
 infra/k8s/scripts/teardown.sh
@@ -445,6 +505,126 @@ resolved ID onto the pod template as an annotation on every
 `03-wait-ready.sh` run, so a content change always produces a real,
 observable rollout (`kubectl rollout status` has something genuine to
 wait on), and a re-run with an unchanged image is a true no-op.
+
+## Safe process termination (Phase 3A.2)
+
+Phase 3A.1's `kill_pid_robust`/`kill_port_robust` are REMOVED.
+`kill_port_robust` looked up whatever PID `netstat` reported listening
+on a configured port and `taskkill`ed it -- a port number proves
+nothing about ownership; by the time cleanup runs, an entirely
+unrelated process could be bound there. `kill_pid_robust` trusted a
+recorded numeric PID the same way -- PIDs are reused by the OS, so a
+bare PID does not establish identity either (this project's own
+evidence already showed stale PID files pointing at processes that
+were no longer the ones that were started).
+
+`infra/k8s/scripts/lib/process-ownership.sh` (+ its Windows-side
+`process-ownership.ps1`) replaces both. It:
+
+- **Captures real identity at start time, not a guess.** Git Bash's own
+  `$!` was tried first and found UNRELIABLE for this: backgrounding a
+  native Win32 process from MSYS bash sometimes returns an intermediate
+  wrapper shell's PID instead of the real target's, and that wrapper
+  can already have exited by the time anything queries it (reproduced
+  directly while building this). `Start-Process -PassThru` is the
+  authoritative alternative -- PowerShell itself hands back the real
+  Win32 PID of what it just created.
+- **Records creation timestamp + executable path + a command-line
+  marker**, specifically to detect PID reuse -- the one thing a bare
+  PID cannot distinguish.
+- **Re-verifies identity immediately before terminating anything**:
+  re-reads the CURRENT process at the recorded PID and requires an
+  EXACT match on creation timestamp (changes instantly if the PID has
+  been reused) and that the current command line still contains the
+  recorded marker. Either check failing means the process is LEFT
+  RUNNING -- never killed on a guess.
+- **Never kills by port.** There is no code path anywhere in this
+  module that looks up "whatever is listening on port N."
+- **Verifies termination, not just that a kill signal was sent**:
+  polls (bounded, 3s) until the process is actually confirmed gone;
+  reports failure, not success, if that bound elapses first.
+- **Preserves recovery information on any failure**: an append-only
+  `.process-ownership-recovery.log` records every refused/unverified
+  stop with full identity detail, so a human can act on it later --
+  never silently dropped.
+- **Never logs credentials.** The only commands this module starts are
+  `kubectl port-forward` invocations (a kubeconfig path, context/
+  namespace names, a Service/pod name, a port pair) -- never a secret.
+  This is a hard constraint on how this module may be reused, not an
+  incidental property of today's only caller.
+
+**A real hang found and fixed while testing this module**: capturing
+the PowerShell script's output via `result="$(powershell.exe ... 2>&1 |
+tr -d '\r')"` hung INDEFINITELY, even though the identical invocation
+returned in under a second when not piped into a command substitution.
+Root cause: `Start-Process` inside the script launches a DETACHED
+grandchild (the actual long-running tracked process); that grandchild
+was found to inherit the outer `powershell.exe` invocation's own
+stdout/stderr pipe write-end on this host, so the pipe's read end
+(bash's `$(...)`) never saw EOF -- it waited for every holder of the
+pipe to close it, including a process that was never going to exit on
+its own. Fixed by redirecting to a FILE and reading it with `cat`
+(which has no children of its own to inherit anything) instead of
+piping directly.
+
+**Tested with an isolated fixture process, never a real user
+process** (`infra/k8s/scripts/lib/process-ownership.test.sh`, 6
+focused tests, all passing): a RelayLab-started fixture is stopped and
+confirmed dead; a stale record simulating PID reuse is refused and the
+real (unrelated) process survives untouched; a genuinely unrelated
+process running throughout cleanup is never touched; an already-exited
+owned process is handled as a safe no-op; a malformed/unidentifiable
+record is refused rather than reported successful.
+
+### A clock-display clarification, not a clock-drift bug
+
+An earlier working session (before this repository's publication)
+raised a "clock drift" concern after observing MySQL's `NOW(3)` differ
+from host wall-clock time by roughly 5.5 hours. Building this very
+module settled it definitively: `Get-CimInstance Win32_Process`'s own
+`CreationDate` is reported with an explicit UTC offset --
+`2026-10-16T00:49:20.8489370+05:30` -- and this repository's own git
+commit timestamps carry the identical `+0530` offset. The host's local
+timezone IS IST (UTC+5:30); this was always a DISPLAY difference
+(local time vs. UTC), never a measured clock skew. Nothing in this
+project compares a host-local timestamp against a server's claimed-UTC
+timestamp across that boundary, so no correctness issue follows from
+it -- stated here only to replace the earlier, less certain framing
+with a confirmed one.
+
+## Fresh-schema reproducibility (Phase 3A.2)
+
+`npm run demo:fresh-schema` (`tests/integration/fresh-schema-verify.ts`)
+proves the migrations actually committed in THIS repository are
+sufficient on their own, independent of the existing demo database's
+own history. It creates its OWN, separately named, disposable database
+(`relaylab_fresh_verify` by default -- refuses to run against `relaylab`
+or `relaylab_test`), using the existing `applyMigrations` mechanism and
+its existing safety rule unchanged, then drops that database again at
+the end. Confirmed, in order: all 11 committed migration files
+(0001-0010, 0012) apply cleanly on the first run; a second run against
+the same database applies zero new migrations (idempotent); both
+`publisher_leader` lock rows (`default`, `consumer-default`) exist
+after migrating; a representative task claim + command receipt via the
+real `TaskStore` succeeds; a representative publish-then-consume cycle
+via real NATS JetStream (an isolated namespace, never the shared dev
+one) ends with `event_count=1`. `relaylab`/`relaylab_test` were
+confirmed untouched throughout (checked via `SHOW DATABASES` before and
+after).
+
+**Provenance limitation, stated plainly, not invented around**: the
+existing demo database (`relaylab`) has a migration row named
+`0011_consumer_leader_lock.sql` recorded with a checksum that does not
+match any file in this repository -- almost certainly from an earlier,
+now-unrecoverable draft of the same change this repository ships as
+`0012_consumer_leader_lock.sql` instead (see CLAUDE.md's "Repository
+structure" note on why 0011 is deliberately missing, and
+evidence/phase1-evidence.md for the full incident). This verification
+proves the gap is NOT load-bearing: a database that never had anything
+named 0011 at all still ends up with the exact state the application
+needs. The old demo database's own history is a historical artifact of
+that one database, not a dependency anything in this codebase has on
+unknown migration content.
 
 ## What this phase deliberately does not do
 

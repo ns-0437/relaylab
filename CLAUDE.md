@@ -11,7 +11,7 @@ around cross-device coding agents. Not affiliated with Capy, does not
 reproduce proprietary internals, and does not claim to fix any specific
 unresolved Capy bug.
 
-## Current phase: Phase 3A.1 (Kubernetes reliability patch -- re-entry safety, consumer exclusivity, dependency-aware readiness, port-forward hardening) complete; Phase 3A Part B (local Kubernetes deployment of the publisher/consumer against cluster MySQL/NATS) complete; Phase 3A Part A (post-verification input-integrity check) complete; Phase 2C correctness patch (cleanup contract, input-protection honesty, archive-attribute fix) complete; Phase 2C.1 (containerized-verification acceptance patch) complete; Phase 2C (containerized verification) complete; Phase 2B.2 (durable-command gap closure, handoff milestone finished) complete; Phase 2B.1 (handoff correctness patch) complete; Phase 2B (committed-checkpoint two-worker handoff) complete; Phase 2A.2 (workspace-classification + checkpoint-validation correctness patch) complete; Phase 2A.1 (committed-state reconciliation correctness patch) complete; Phase 2A (one real Git execution worker) complete; Phase 1.2.1 (OpenTelemetry + Prometheus/Grafana monitoring + reliability patch) complete
+## Current phase: Phase 3A.2 (process-ownership safety, precise consumer lease guarantee, fresh-schema reproducibility) complete; Phase 3A.1 (Kubernetes reliability patch -- re-entry safety, consumer exclusivity, dependency-aware readiness, port-forward hardening) complete; Phase 3A Part B (local Kubernetes deployment of the publisher/consumer against cluster MySQL/NATS) complete; Phase 3A Part A (post-verification input-integrity check) complete; Phase 2C correctness patch (cleanup contract, input-protection honesty, archive-attribute fix) complete; Phase 2C.1 (containerized-verification acceptance patch) complete; Phase 2C (containerized verification) complete; Phase 2B.2 (durable-command gap closure, handoff milestone finished) complete; Phase 2B.1 (handoff correctness patch) complete; Phase 2B (committed-checkpoint two-worker handoff) complete; Phase 2A.2 (workspace-classification + checkpoint-validation correctness patch) complete; Phase 2A.1 (committed-state reconciliation correctness patch) complete; Phase 2A (one real Git execution worker) complete; Phase 1.2.1 (OpenTelemetry + Prometheus/Grafana monitoring + reliability patch) complete
 
 **Phase 3A Part A, this session**: closes the remaining input-integrity
 gap the Phase 2C correctness patch (below) explicitly narrowed rather
@@ -143,6 +143,88 @@ commands, and tool/image versions -- not duplicated here. Summary:
   no loss) -- while correctly distinguishing a deliberately-broken
   pod-direct port-forward (expected) from an actual application failure
   (never observed).
+
+**Phase 3A.2, this session**: a bounded follow-up on Phase 3A.1 --
+process-cleanup ownership, an accurate (not overclaimed) consumer lease
+guarantee, and fresh-schema reproducibility. Worked in the
+GitHub-connected publication copy
+(`relaylab-public`), on branch `phase-3a2-process-safety`, not the older
+working directory -- see "Where this work happened" below. Does NOT
+reopen input integrity, the base deployment, the A->B handoff, the
+original pod-replacement proof, or Phase 3A.1's own re-entry/health/
+image-loading work -- those stand as delivered.
+
+- **Process-ownership replaces port/PID-based termination entirely**:
+  Phase 3A.1's `kill_pid_robust`/`kill_port_robust` are REMOVED, not
+  patched -- `kill_port_robust` killed whatever PID `netstat` reported
+  on a configured port (proves nothing about ownership), and
+  `kill_pid_robust` trusted a recorded PID without checking it still
+  identified the same process (PIDs are reused). The replacement
+  (`infra/k8s/scripts/lib/process-ownership.sh` + `.ps1`) captures real
+  Win32 identity (PID + creation timestamp + exe path) via
+  `Start-Process -PassThru` at start time (Git Bash's own `$!` was tried
+  first and found UNRELIABLE -- reproduced directly: backgrounding a
+  native process from MSYS bash sometimes returns an intermediate
+  wrapper's PID instead of the target's), and re-verifies that EXACT
+  identity before ever terminating anything. A mismatch leaves the
+  process running and writes to an append-only recovery log rather than
+  guessing. 6 focused tests, all passing, against an isolated fixture
+  process (`node -e` loops with a unique marker) -- never a real user
+  process. A real hang was found and fixed while building this: piping
+  the PowerShell call's output into a bash command substitution hung
+  indefinitely because a DETACHED grandchild (the actual tracked
+  process) inherited the pipe's write end and never closed it; fixed by
+  redirecting to a file and reading it with `cat` instead.
+- **The consumer lease guarantee is now precisely documented, not
+  overclaimed**: inspected the complete acquire -> process -> renew
+  path and found the lease is checked ONCE per iteration, before
+  `processBatch`, with its epoch never threaded into that call --
+  `processBatch`'s own duration is not bounded by the lease. Corrected
+  every place (source comments, CLAUDE.md, docs/KUBERNETES.md) that
+  implied a universal "exactly one active process" guarantee. The
+  actual claim: the lease coordinates normal polling; an already-
+  authorized in-flight operation CAN outlive it. What protects durable
+  correctness under that overlap is consumer.ts's own transactional row
+  locking, not the lease -- proven deterministically in a new test
+  (`tests/integration/consumer-lease-overlap.test.ts`) that calls
+  `applyEventWithDedup` TWICE, concurrently (`Promise.all`), for the
+  SAME event, and confirms exactly one durable application
+  (`event_count` stays 1) regardless. No new distributed-lock design
+  was introduced -- inspection showed the existing transactional design
+  already protects what matters.
+- **Fresh-schema reproducibility, proven on a disposable database**:
+  `npm run demo:fresh-schema` creates its OWN, separately named database
+  (never `relaylab`/`relaylab_test`), applies every committed migration
+  from scratch, confirms a second run is a true no-op, confirms both
+  `publisher_leader` lock rows exist, exercises a representative task/
+  receipt and a representative publish-consume cycle, then drops the
+  database. Confirms the existing demo database's unexplained historical
+  `0011` migration row (different checksum than any file in this repo --
+  see "Repository structure" below for where that gap is recorded) is
+  NOT load-bearing: a database that never had anything named 0011 still
+  ends up in the exact state the application needs.
+- **A UTC/IST clarification, not a clock-drift bug**: an earlier
+  session's "clock drift" concern (MySQL's `NOW(3)` differing from host
+  wall-clock time by ~5.5 hours) is settled definitively by this
+  session's own `Win32_Process.CreationDate` output
+  (`...+05:30`) and this repo's own git commit timestamps (`+0530`) --
+  the host's local timezone IS IST; this was always a display
+  difference, never a measured clock skew.
+
+### Where this work happened
+
+Two copies of this project exist on this machine: the older working
+directory (`C:\Documents2\resume-optimizer\relaylab`, where Phase 3A
+Part A/B and 3A.1 were originally built) and this GitHub-connected
+publication copy. Per this patch's own instruction, all Phase 3A.2 work
+was done HERE, on a new branch, and the older working directory was
+inspected but never written to, had nothing copied from it, and its
+already-published import was not reconstructed. The two copies'
+`infra/k8s` tooling targets the SAME already-running local `kind`
+cluster (`relaylab-local`) and dev MySQL/NATS (`infra/compose.yaml`,
+project name `relaylab`) on this host -- re-entering that already-live
+state is what "fresh-schema reproducibility" above and the live
+validation below actually exercised, not a newly stood-up environment.
 
 **Phase 3A.1, this session**: a bounded reliability patch on the Phase
 3A Part B Kubernetes deployment -- makes setup re-entry safe, enforces
@@ -972,13 +1054,27 @@ tests/
                  runPublisherOnce itself, unlike recovery-scenario.ts;
                  run via `npm run demo:k8s-messaging`, driven by
                  infra/k8s/scripts/04-run-demo.sh and
-                 05-pod-replacement-demo.sh).
+                 05-pod-replacement-demo.sh). Since Phase 3A.2:
+                 consumer-lease-overlap.test.ts (new -- two GENUINELY
+                 CONCURRENT applyEventWithDedup calls for the same
+                 event, proving exactly one durable application despite
+                 overlap; see "Consumer exclusivity: what the lease
+                 actually guarantees" in docs/KUBERNETES.md) and
+                 fresh-schema-verify.ts (new -- creates its own
+                 disposable database, applies every committed migration
+                 from scratch, confirms idempotency and required lock
+                 state, exercises a representative task/receipt and
+                 consumer operation, then drops it; run via `npm run
+                 demo:fresh-schema`).
 infra/
   migrations/    ordered, checksummed *.sql files (schema source of truth). Numbered 0011 is
                  MISSING by design, not an error -- Phase 3A.1's checksum-integrity check
                  caught a mismatched prior 0011 attempt and refused to proceed (correctly);
                  the new migration was renumbered to 0012 rather than editing an applied one.
-                 See docs/KUBERNETES.md "Migration failure still gates readiness."
+                 See docs/KUBERNETES.md "Migration failure still gates readiness." Since
+                 Phase 3A.2, proven NOT load-bearing: tests/integration/fresh-schema-verify.ts
+                 applies every migration from scratch on a database that never had anything
+                 numbered 0011 at all, and the application works identically.
   mysql-init/    docker-entrypoint-initdb.d script creating the disposable test database
   verify-image/  Phase 2C, new: Dockerfile for the ONE pinned verification
                  image (`node:24.21.0-alpine3.24`, non-root `node` user,
@@ -999,9 +1095,17 @@ infra/
                  Deployments), scripts/ (prereqs, build/load, up,
                  wait-ready-and-migrate, start/stop port-forwards,
                  run-demo, pod-replacement-demo, teardown -- see
-                 docs/KUBERNETES.md for the full runbook). .kubeconfig/
-                 .secrets.env/.port-forward-pids are generated locally
-                 by these scripts and gitignored, never committed.
+                 docs/KUBERNETES.md for the full runbook). Since Phase
+                 3A.2: scripts/lib/process-ownership.sh + .ps1 +
+                 .test.sh (real Win32 process identity capture/
+                 verification, replacing kill_pid_robust/kill_port_robust
+                 entirely -- see docs/KUBERNETES.md "Safe process
+                 termination"); .pf-mysql.record/.pf-nats.record/
+                 .pf-migrate.record/.pf-pod-direct.record replace the
+                 old single .port-forward-pids file (one record per
+                 tracked process). .kubeconfig/.secrets.env/.pf-*.record
+                 are all generated locally by these scripts and
+                 gitignored, never committed.
   compose.yaml   local MySQL 8.4 + NATS JetStream (dev credentials, localhost-bound),
                  plus an optional `observability` profile for the OTel Collector AND
                  (since Phase 1.2.1) Prometheus + Grafana. INDEPENDENT of infra/k8s/ --
