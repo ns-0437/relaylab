@@ -5,21 +5,20 @@
 // tests already use for container readiness, not a sleep-based guess).
 // Real Git/MySQL/Docker throughout.
 //
-// Covers worker B's restore re-verification (handoff.ts) below.
-// Deliberately does NOT also attempt this for worker A's deterministic
-// path (run-task.ts): investigated directly and found structurally
-// unachievable with this fixture, not merely flaky -- see
-// docs/KUBERNETES.md-style note in README.md "Demo UI" for the exact
-// reason (the completion marker is captured via a live stdout stream
-// listener attached BEFORE the container-confirmed-running poll even
-// starts; that poll has an inherent >=50ms minimum latency per cycle,
-// while this fixture's verify.js finishes in low single-digit
-// milliseconds, so the marker is already resolved, deterministically,
-// before onContainerCreated ever fires -- confirmed by direct code
-// reading of docker-verify.ts, not by trial and error alone). run-task.ts
-// and handoff.ts both still accept and propagate a real `signal` (see
-// their own code) -- only THIS specific mid-container barrier technique
-// could not be exercised for the near-instant deterministic fixture.
+// Covers worker B's restore re-verification (handoff.ts) AND worker A's
+// deterministic path (run-task.ts) below.
+//
+// Worker A's mid-container barrier specifically required a TEST-ONLY
+// slow fixture (createSlowFixtureRepo below -- never used by production
+// code or fixture-repo.ts): the real production fixture's verify.js
+// finishes in low single-digit milliseconds, faster than
+// docker-verify.ts's own >=50ms-per-cycle "confirm running" poll can
+// reliably observe before the completion marker (captured via a live
+// stdout stream listener attached BEFORE that poll even starts) has
+// already resolved -- confirmed by direct code reading, not trial and
+// error. That is a property of the FAST production fixture, not a
+// fundamental limit on testing cancellation itself -- the slow fixture
+// below, otherwise byte-for-byte identical, closes the gap.
 import { test, before, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp } from "node:fs/promises";
@@ -27,13 +26,72 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import type mysql from "mysql2/promise";
 import { Effect } from "effect";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { mkdir, writeFile } from "node:fs/promises";
 import { makeTaskStoreLive } from "../../src/db/task-store.js";
 import { applySchema, requireMysqlPool, truncateAll, uniqueId } from "./helpers.js";
 import { createFixtureRepo } from "../../src/worker/fixture-repo.js";
 import { runGitWorkerTask, defaultAttemptId, branchNameFor } from "../../src/worker/run-task.js";
 import { createManagedWorkspaceRoot, resolveWorktreePath, resolveIsolatedHomeDir } from "../../src/worker/workspace.js";
-import { makeIsolatedGitEnv } from "../../src/worker/git.js";
+import { makeIsolatedGitEnv, git } from "../../src/worker/git.js";
 import { prepareHandoffArtifact, requestOwnershipTransfer, restoreAndAcknowledge, handoffCommandId } from "../../src/worker/handoff.js";
+
+const execFileAsync = promisify(execFile);
+
+/**
+ * TEST-ONLY fixture repo, used by NOTHING in production code --
+ * identical to fixture-repo.ts's createFixtureRepo except verify.js
+ * busy-waits for ~3s before asserting. This is what actually makes
+ * mid-execution cancellation of the DETERMINISTIC path testable: the
+ * real production fixture's verify.js finishes in low single-digit
+ * milliseconds, faster than docker-verify.ts's own >=50ms-per-cycle
+ * "confirm running" poll can reliably observe (see the module header
+ * above) -- that is a property of the FAST fixture, not a fundamental
+ * limit of cancellation itself. A deliberately slower, otherwise
+ * identical fixture closes that gap without touching
+ * fixture-repo.ts or any production code path.
+ */
+async function createSlowFixtureRepo(destDir: string): Promise<{ repoDir: string; baseCommit: string }> {
+  const ADD_JS_BUGGY = `function add(a, b) {\n  return a - b;\n}\n\nmodule.exports = { add };\n`;
+  const SLOW_VERIFY_JS = [
+    `const start = Date.now();`,
+    `while (Date.now() - start < 3000) { /* deterministic, bounded busy-wait -- inside the verified container only, never production code */ }`,
+    `const assert = require("node:assert/strict");`,
+    `const { add } = require("./src/add.js");`,
+    `assert.equal(add(2, 3), 5, "add(2, 3) must equal 5");`,
+    `console.log("verify.js: PASS");`,
+  ].join("\n");
+
+  await mkdir(destDir, { recursive: true });
+  const isolatedHome = path.join(destDir, ".fixture-home");
+  await mkdir(isolatedHome, { recursive: true });
+  const env = makeIsolatedGitEnv(isolatedHome);
+
+  await git(["init", "--initial-branch=main"], destDir, env);
+  await mkdir(path.join(destDir, "src"), { recursive: true });
+  await writeFile(path.join(destDir, "src", "add.js"), ADD_JS_BUGGY, "utf8");
+  await writeFile(path.join(destDir, "verify.js"), SLOW_VERIFY_JS, "utf8");
+
+  await git(["add", "-A"], destDir, env);
+  await git(
+    ["-c", "user.name=relaylab-fixture", "-c", "user.email=relaylab-fixture@localhost", "-c", "commit.gpgsign=false", "commit", "--no-verify", "-m", "baseline (slow verify, test-only): add() has a known subtraction bug"],
+    destDir,
+    env,
+  );
+  const { stdout } = await git(["rev-parse", "HEAD"], destDir, env);
+  return { repoDir: destDir, baseCommit: stdout.trim() };
+}
+
+/** Confirms a container is genuinely gone (removed), not merely stopped -- docker-verify.ts's own cancellation path is expected to stop AND remove it. */
+async function containerIsGone(containerId: string): Promise<boolean> {
+  try {
+    await execFileAsync("docker", ["inspect", containerId]);
+    return false;
+  } catch {
+    return true;
+  }
+}
 
 let pool: mysql.Pool;
 let managedRoot: string;
@@ -65,6 +123,43 @@ async function claim(taskId: string, ownerId: string) {
   return Effect.runPromise(store.claimTask(taskId, ownerId, 120_000));
 }
 
+test("deterministic path, SLOW test-only fixture: cancelling at the moment the container is confirmed running stops/removes the owned container, produces no checkpoint, and is reported as cancelled", async () => {
+  const fixtureDir = path.join(fixtureParentDir, uniqueId("slow-fixture"));
+  const fixture = await createSlowFixtureRepo(fixtureDir);
+  const taskId = uniqueId("cancel-det-slow-task");
+  const claimResult = await claim(taskId, "worker-cancel-a-slow");
+  const controller = new AbortController();
+  let observedContainerId: string | undefined;
+
+  const outcome = await runGitWorkerTask({
+    taskId,
+    ownerId: "worker-cancel-a-slow",
+    epoch: claimResult.epoch,
+    sourceRepoDir: fixture.repoDir,
+    requestedCommitRef: fixture.baseCommit,
+    managedWorkspaceRoot: managedRoot,
+    pool,
+    signal: controller.signal,
+    onVerifyContainerCreated: (containerId) => {
+      observedContainerId = containerId;
+      // The 3s busy-wait in verify.js gives this real, confirmed-running
+      // container ample time to still be alive when the abort signal
+      // fires -- no scheduling trick needed (unlike the fast fixture).
+      controller.abort();
+    },
+  });
+
+  assert.ok(observedContainerId, "the container-confirmed-running barrier must have fired for the slow fixture");
+  assert.equal(outcome.kind, "verification_cancelled", `expected verification_cancelled, got ${outcome.kind}`);
+  assert.equal(outcome.verification.outcome, "cancelled");
+
+  const gone = await containerIsGone(observedContainerId!);
+  assert.ok(gone, "the owned container must be stopped and removed after cancellation, not left running");
+
+  const [rows] = await pool.query(`SELECT COUNT(*) AS c FROM task_checkpoints WHERE task_id = ?`, [taskId]);
+  assert.equal((rows as { c: number }[])[0]!.c, 0, "a cancelled verification must never produce a checkpoint row");
+});
+
 test("deterministic path: the signal is genuinely propagated into Docker verification (VerificationRequest.signal), confirmed via an already-aborted signal refusing to even start", async () => {
   // Not a mid-container barrier (see file header for why that specific
   // technique is unachievable for this fixture) -- this proves the
@@ -95,7 +190,7 @@ test("deterministic path: the signal is genuinely propagated into Docker verific
 });
 
 test("worker B restore re-verification: cancelling at the moment B's real container is confirmed running leaves no acknowledgement, never undoing anything already durable", async () => {
-  const fixture = await freshFixture();
+  const fixture = await createSlowFixtureRepo(path.join(fixtureParentDir, uniqueId("slow-restore")));
   const taskId = uniqueId("cancel-restore-task");
   const ownerA = "worker-cancel-restore-a";
   const claimResult = await claim(taskId, ownerA);
@@ -178,4 +273,7 @@ test("worker B restore re-verification: cancelling at the moment B's real contai
 
   const taskAfterCancel = await Effect.runPromise(store.getTask(taskId));
   assert.equal(taskAfterCancel.checkpointDigest, taskAfterA.checkpointDigest, "A's checkpoint digest must be unchanged");
+  const [handoffs] = await pool.query(`SELECT restore_ack_command_id FROM task_handoffs WHERE task_id = ? AND handoff_id = ?`, [taskId, handoffCommandId(taskId, handoffId)]);
+  assert.equal((handoffs as { restore_ack_command_id: string | null }[]).length, 1);
+  assert.equal((handoffs as { restore_ack_command_id: string | null }[])[0]!.restore_ack_command_id, null, "cancelled B must not acknowledge the handoff");
 });

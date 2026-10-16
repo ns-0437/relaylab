@@ -37,11 +37,20 @@ async function get(path: string) {
 }
 
 /** Bounded poll (not indefinite) for the executor's in-memory "one active run" slot to clear after a cancel. */
+/**
+ * Bounded poll (not indefinite). A cancel requested EARLY (e.g. during
+ * worktree setup/materialization, before Docker verification's own
+ * signal-checked step is even reached) does not take effect until
+ * execution actually reaches a point that checks the signal -- that
+ * can take the same real wall-clock time a normal run's earlier stages
+ * take, so this bound is sized generously against that, not against
+ * how long cancellation "should" ideally take.
+ */
 async function waitForNoActiveRun(): Promise<void> {
-  for (let i = 0; i < 20; i++) {
+  for (let i = 0; i < 60; i++) {
     const { body } = await get("/api/runs");
     if ((body as { activeRunId: string | null }).activeRunId === null) return;
-    await new Promise((r) => setTimeout(r, 300));
+    await new Promise((r) => setTimeout(r, 500));
   }
   throw new Error("timed out waiting for the active run slot to clear");
 }
@@ -197,5 +206,68 @@ test("failed run-lifecycle insertion releases its reservation -- a subsequent st
   const recovered = await post("/api/runs", { mode: "ai-simulated" });
   assert.equal(recovered.status, 201, "a new run must start successfully once the table is restored -- the failed insertion must never have left the active slot permanently occupied");
   await post(`/api/runs/${(recovered.body as { runId: string }).runId}/cancel`, {});
+  await waitForNoActiveRun();
+});
+
+test("simultaneous starts: two genuinely concurrent POST /api/runs admit exactly one, never both", async () => {
+  // Fired in the SAME synchronous expression (Promise.all), not
+  // sequentially -- both requests' HTTP bodies are read and their
+  // startRun() calls race for real. The CONFIRMED defect (`active` set
+  // only after `await insertRun(...)` resolved) would let both pass the
+  // `if (active)` check and both be admitted; the fix (reserving
+  // synchronously, before the first await) guarantees at most one
+  // wins, REGARDLESS of which request's body happens to finish parsing
+  // first -- so this asserts the outcome set, not a specific winner.
+  const [a, b] = await Promise.all([post("/api/runs", { mode: "deterministic" }), post("/api/runs", { mode: "deterministic" })]);
+  const statuses = [a.status, b.status].sort();
+  assert.deepEqual(statuses, [201, 409], `expected exactly one admission (201) and one rejection (409), got ${JSON.stringify(statuses)}`);
+  const admitted = a.status === 201 ? a : b;
+  const rejected = a.status === 201 ? b : a;
+  assert.equal((rejected.body as { error: { code: string } }).error.code, "run_conflict");
+
+  const runId = (admitted.body as { runId: string }).runId;
+  await post(`/api/runs/${runId}/cancel`, {});
+  await waitForNoActiveRun();
+});
+
+test("confirmed lock loss during an active run blocks further admission and cancels that run -- a stale instance can never keep working after losing ownership", async () => {
+  // Drives the EXACT callback body server.ts's onLost wires up (see
+  // createApiServer: `blockAdmission(); cancelActiveRunForLockLoss();`)
+  // against THIS already-running instance's own active run, via its real
+  // HTTP surface. A genuine lock-row takeover triggering that same
+  // callback is covered separately (singleton-lock.test.ts, against the
+  // lock primitive itself) -- a second real server instance cannot be
+  // started here to force one end-to-end, since the singleton lock
+  // correctly refuses to let any second instance start against the same
+  // database at all (see the "singleton lock" test above). This proves
+  // the OTHER half: that once that callback fires, a stale instance's
+  // admission is genuinely blocked and its active run is genuinely
+  // cancelled, not merely flagged.
+  const { blockAdmission, cancelActiveRunForLockLoss } = await import("../../src/api/executor.js");
+
+  const started = await post("/api/runs", { mode: "deterministic" });
+  assert.equal(started.status, 201, `expected to start cleanly, got ${started.status}: ${JSON.stringify(started.body)}`);
+  const runId = (started.body as { runId: string }).runId;
+
+  blockAdmission();
+  cancelActiveRunForLockLoss();
+
+  const blocked = await post("/api/runs", { mode: "deterministic" });
+  assert.equal(blocked.status, 503, "admission must be blocked once lock loss is confirmed");
+  assert.equal((blocked.body as { error: { code: string } }).error.code, "admission_blocked");
+
+  // Same generous bound as waitForNoActiveRun() -- a cancel requested
+  // while deterministic-mode execution is still in worktree
+  // setup/materialization (not yet signal-aware) does not take effect
+  // until execution reaches Docker-verify's own signal-checked step.
+  let detail: { status: number; body: unknown } | undefined;
+  for (let i = 0; i < 60; i++) {
+    detail = await get(`/api/runs/${runId}`);
+    const status = (detail.body as { run: { status: string } }).run.status;
+    if (status === "cancelled" || status === "failed") break;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  const finalStatus = (detail!.body as { run: { status: string } }).run.status;
+  assert.equal(finalStatus, "cancelled", `the active run must be actually cancelled once lock loss is confirmed, not left displayed as running -- got status ${finalStatus}`);
   await waitForNoActiveRun();
 });
