@@ -15,8 +15,8 @@ require_cluster_exists
 # shellcheck disable=SC1090
 source "$SECRETS_FILE"
 
-if [ ! -f "$PORT_FORWARD_PID_FILE" ]; then
-  fail "no port-forwards running -- run start-port-forwards.sh first."
+if [ ! -f "$MYSQL_PF_RECORD" ]; then
+  fail "no port-forwards tracked ($MYSQL_PF_RECORD not found) -- run start-port-forwards.sh first."
 fi
 
 log "=== confirming the port-forward actually reaches the CLUSTER database, not infra/compose.yaml's dev MySQL ==="

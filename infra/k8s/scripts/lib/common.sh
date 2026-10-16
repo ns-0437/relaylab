@@ -35,13 +35,49 @@ K8S_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"   # infra/k8s (com
 REPO_ROOT="$(cd "$K8S_DIR/../.." && pwd)"
 KUBECONFIG_FILE="$K8S_DIR/.kubeconfig"          # dedicated, gitignored -- never touches ~/.kube/config
 SECRETS_FILE="$K8S_DIR/.secrets.env"            # generated, gitignored
-PORT_FORWARD_PID_FILE="$K8S_DIR/.port-forward-pids"
+# Phase 3A.2: one record file PER tracked port-forward (process-ownership.sh's
+# unit of tracking), replacing the old single flat PID-list file.
+MYSQL_PF_RECORD="$K8S_DIR/.pf-mysql.record"
+NATS_PF_RECORD="$K8S_DIR/.pf-nats.record"
 
 export KUBECONFIG="$KUBECONFIG_FILE"
 
 kctl() {
   kubectl --kubeconfig "$KUBECONFIG_FILE" --context "kind-$CLUSTER_NAME" --namespace "$NAMESPACE" "$@"
 }
+
+# The same effective command as kctl(), but as a flat argument STRING
+# (not run) -- for process-ownership.sh's po_start, which needs the
+# filepath and arguments as plain strings so it can capture the real
+# process identity of exactly what it launches.
+#
+# TWO real bugs found running this on this host, both now fixed:
+# 1. $KUBECONFIG_FILE is double-quoted: PowerShell's Start-Process
+#    -ArgumentList (string form) splits on whitespace the same way a
+#    shell command line does, and this path contains one (this
+#    account's home directory has a space in it). Without quoting,
+#    "--kubeconfig C:\Users\Navin Kumar\..." became TWO broken tokens
+#    and kubectl failed with "flags cannot be placed before plugin
+#    name" -- confirmed directly.
+# 2. $KUBECONFIG_FILE is converted to a native Windows path via
+#    `cygpath -w` first. Bash normally auto-translates a POSIX-style
+#    path (/c/Users/...) to a Windows one ONLY when it is itself
+#    invoking a native .exe's argv directly -- that translation never
+#    happens for a path that is merely embedded as TEXT inside a string
+#    handed to a DIFFERENT program (here, powershell.exe, which treats
+#    it as opaque and passes it straight to kubectl.exe via
+#    Start-Process/CreateProcess, with no MSYS layer involved at all).
+#    Without this, kubectl failed with "GetFileAttributesEx
+#    /c/Users/...: The system cannot find the path specified" --
+#    confirmed directly.
+kctl_args() {
+  local win_kubeconfig
+  win_kubeconfig="$(cygpath -w "$KUBECONFIG_FILE")"
+  echo "--kubeconfig \"$win_kubeconfig\" --context kind-$CLUSTER_NAME --namespace $NAMESPACE $*"
+}
+
+# shellcheck source=./process-ownership.sh
+source "$(dirname "${BASH_SOURCE[0]}")/process-ownership.sh"
 
 log() { echo "[relaylab-k8s] $*"; }
 fail() { echo "[relaylab-k8s] ERROR: $*" >&2; exit 1; }
@@ -111,51 +147,19 @@ be found there) and re-run."
 # `kubectl rollout status` has something real to wait on -- the smallest
 # fix that makes "re-run setup" actually redeploy a rebuilt image,
 # without introducing image digests/registries this phase doesn't use.
-# Phase 3A.1: a real reliability gap found WHILE validating this very
-# patch -- plain `kill "$pid"` against a backgrounded `kubectl
-# port-forward` repeatedly left the underlying Windows process alive as
-# an orphan (observed directly, multiple times, via `netstat -ano` after
-# a script's own `kill` call had already run and reported no error).
-# This Git-Bash/MSYS environment's `kill` does not reliably reach a
-# native Win32 process the way POSIX SIGTERM would on Linux/macOS.
-# `taskkill //F` against the SAME pid is the actually-reliable
-# mechanism here; `kill` is tried first (cheap, sufficient on a real
-# POSIX host) and `taskkill` is the fallback, never the other way
-# around, so this stays a no-op cost on a non-Windows host.
-kill_pid_robust() {
-  local pid="$1"
-  kill "$pid" 2>/dev/null || true
-  # Always ALSO tries taskkill, unconditionally -- do not gate this on a
-  # `kill -0 "$pid"` check first: that check can itself report "not
-  # alive" for a bash-side job handle while the real underlying Windows
-  # process (a different, or the same, PID from this environment's
-  # perspective) is still running, which is exactly the false negative
-  # observed in practice. taskkill against an already-gone PID just
-  # errors harmlessly (suppressed below).
-  if command -v taskkill >/dev/null 2>&1; then
-    taskkill //PID "$pid" //F >/dev/null 2>&1 || true
-  fi
-}
-
-# Phase 3A.1: even `kill_pid_robust` (PID + taskkill) was observed to
-# miss, in practice -- a `kubectl port-forward` backgrounded from Git
-# Bash is not always the SAME Windows PID bash's `$!` reports (an
-# intermediate wrapper is sometimes what `$!` actually names). The one
-# mechanism that reliably worked in every case actually hit while
-# validating this patch: look up whatever PID the OS itself reports as
-# LISTENING on the exact port, and taskkill THAT -- it is unambiguous by
-# construction, independent of whatever bash's job control believes.
-kill_port_robust() {
-  local port="$1"
-  if ! command -v netstat >/dev/null 2>&1 || ! command -v taskkill >/dev/null 2>&1; then
-    return 0
-  fi
-  local pid
-  pid="$(netstat -ano 2>/dev/null | grep "127.0.0.1:${port} " | grep LISTENING | awk '{print $NF}' | head -1)"
-  if [ -n "$pid" ]; then
-    taskkill //PID "$pid" //F >/dev/null 2>&1 || true
-  fi
-}
+# Phase 3A.2: kill_pid_robust/kill_port_robust (Phase 3A.1) are REMOVED.
+# kill_port_robust killed whatever PID netstat reported on a configured
+# port, and kill_pid_robust trusted a recorded numeric PID without
+# verifying it still identified the same process -- neither establishes
+# actual ownership (a port or a reused PID proves nothing about which
+# process is really there). See infra/k8s/scripts/lib/process-ownership.sh
+# (sourced by every script that needs it) for the replacement: it
+# captures real Win32 process identity (PID + creation timestamp +
+# executable path) at start time and re-verifies that exact identity
+# before ever terminating anything, never killing by port and never
+# killing an identity it cannot confirm. See docs/KUBERNETES.md "Safe
+# process termination" for the full design and the real hang/PID-mapping
+# bugs found and fixed while building it.
 
 stamp_and_rollout() {
   local deployment="$1" image_id="$2"

@@ -18,20 +18,37 @@ import { tryAcquireOrRenewExclusiveLock } from "./publisher-lock.js";
 const MAX_BACKOFF_MS = 5000;
 const STEADY_STATE_DELAY_MS = 0; // processBatch's own `expires` already paces polling
 const INSTANCE_ID = `consumer-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
-// Phase 3A.1: Kubernetes' replicas:1 + the Deployments' Recreate
+// Phase 3A.1/3A.2: Kubernetes' replicas:1 + the Deployments' Recreate
 // strategy (see infra/k8s/manifests/50-consumer.yaml) only protect a
 // NORMAL rollout -- they do nothing against a manual second Pod, a
 // forced/SIGKILL-style termination racing a replacement, or someone
-// setting replicas:2 by hand. This lock is the actual enforcement,
-// independent of how the process was started: reuses the EXACT same
+// setting replicas:2 by hand. This lock reuses the EXACT same
 // DB-backed epoch+lease mechanism as the publisher's leader lock
 // (src/messaging/publisher-lock.ts), under its own `lock_name` so the
-// two locks never interact. See docs/KUBERNETES.md "Consumer
-// exclusivity" for why this is needed even though consumer.ts's own
-// per-(consumer_name,task_id) transactional row locking and per-event_id
-// dedup already prevent CORRUPTION under naive concurrent execution --
-// this lock's job is to prevent two instances from ever actively
-// competing for work in the first place, not to patch a correctness gap.
+// two locks never interact.
+//
+// PRECISE GUARANTEE (corrected in Phase 3A.2 -- the comment this
+// replaces overclaimed it): the lease is checked ONCE per poll
+// iteration, BEFORE calling processBatch, and its epoch is never
+// threaded into processBatch itself. This coordinates the NORMAL case
+// well -- a standby instance that fails to acquire/renew simply never
+// starts a new iteration, which is what stops two instances from
+// routinely competing for work. It does NOT bound how long an
+// already-authorized processBatch call may run: if one call happens to
+// outlive CONSUMER_LOCK_LEASE_MS (slow NATS fetch, slow DB work, GC
+// pause), this process's NEXT lock check can fail and a different
+// instance can legitimately take over and start its OWN iteration while
+// the first call is still finishing. This is a real, understood,
+// accepted gap for this milestone, not a claim of universal "exactly
+// one active process at every instant" -- deterministically proven
+// in tests/integration/consumer-lease-overlap.test.ts, which runs two
+// genuinely concurrent applyEventWithDedup calls for the SAME event and
+// confirms the result is still exactly one durable application. THAT
+// correctness -- no duplicate committed effect, regardless of overlap
+// -- comes from consumer.ts's own transactional row locking and
+// per-event_id dedup (see applyEventWithDedup), not from this lease.
+// See docs/KUBERNETES.md "Consumer exclusivity: what the lease actually
+// guarantees" for the full writeup.
 const CONSUMER_LOCK_NAME = "consumer-default";
 const CONSUMER_LOCK_LEASE_MS = 3000;
 

@@ -27,7 +27,8 @@
     "test:monitoring-scenarios": "node --import tsx --test tests/integration/monitoring-scenarios.manual.ts",
     "docker:build-verify-image": "docker build -t relaylab-verify:24.21.0-alpine3.24 infra/verify-image",
     "test:docker-verify": "node --import tsx --test tests/integration/docker-verify.test.ts",
-    "demo:k8s-messaging": "tsx tests/integration/demo-k8s-messaging.ts"
+    "demo:k8s-messaging": "tsx tests/integration/demo-k8s-messaging.ts",
+    "demo:fresh-schema": "tsx tests/integration/fresh-schema-verify.ts"
   },
   "dependencies": {
     "@opentelemetry/api": "1.9.1",
