@@ -149,21 +149,54 @@ called -- its returned `epoch` is never passed into `processBatch`, and
 `consumer.ts`'s own transactional row locking
 (`SELECT ... FOR UPDATE` on both `consumer_processed` and
 `task_consumer_state`, inside one transaction per event via
-`applyEventWithDedup`) -- not the lease. Proven deterministically in
-`tests/integration/consumer-lease-overlap.test.ts`: two calls to
-`applyEventWithDedup` for the exact same event, issued via
-`Promise.all` (genuinely concurrent, not sequential), still produce
-exactly ONE durable application (`event_count` stays `1`, one
-`consumer_processed` row, outcomes `["applied", "deduped"]`) -- the
-database's own row lock serializes the second caller behind the first
-regardless of which "lock holder" either caller believed itself to be.
+`applyEventWithDedup`) -- not the lease. `tests/integration/consumer-lease-overlap.test.ts`
+proves this with TWO distinct tests, deliberately not conflated:
+
+- A **transactional-dedup test** (its own title says outright that it is
+  NOT a lease-takeover test -- no lock is acquired or expired anywhere
+  in it): two calls to `applyEventWithDedup` for the exact same event,
+  issued via `Promise.all` (genuinely concurrent, not sequential), still
+  produce exactly ONE durable application (`event_count` stays `1`, one
+  `consumer_processed` row, outcomes `["applied", "deduped"]`) -- the
+  database's own row lock serializes the second caller behind the first
+  regardless of which "lock holder" either caller believed itself to be.
+- A **real lease-takeover test** (Phase 3A.2 corrective patch), which
+  drives `tryAcquireOrRenewExclusiveLock` itself end to end on an
+  isolated `lock_name`: Holder A acquires; is paused at an explicit
+  `Promise`-based barrier (never a real sleep) before its own durable
+  operation; the lease is force-expired with a direct SQL
+  `UPDATE publisher_leader SET lease_expires_at = <past>` (deterministic,
+  not timing-dependent); Holder B then genuinely acquires with a
+  strictly newer epoch; only THEN is Holder A released, so its
+  previously-authorized operation truly overlaps Holder B's own, on the
+  SAME event. The durable effect still happens exactly once. This test's
+  own docstring is explicit that it does NOT claim strict exclusion --
+  the accepted contract is coordination of normal polling plus
+  transactional protection of the durable effect, the same claim this
+  section makes above, now exercised against the real lock rather than
+  two bare concurrent calls with no lock context at all.
+
 This is the precise distinction this milestone draws: overlapping
 EXECUTION (two calls running at once) is not the same thing as a
 duplicate durable EFFECT (which does not happen here). No new
 distributed-lock design was introduced to CLOSE this gap -- inspection
 showed the existing transactional design already protects the durable
 effects that matter; what changed is the documentation accurately
-describing the lease's real scope instead of overclaiming it.
+describing the lease's real scope instead of overclaiming it, and the
+test suite now has one test honestly labeled as NOT exercising the lock
+and a separate one that genuinely does.
+
+A real, pre-existing MySQL InnoDB hazard was found while repeatedly
+running both tests: two genuinely concurrent `SELECT ... FOR UPDATE`
+followed by `INSERT` on a not-yet-existing unique row (`consumer_processed`)
+can trigger a transient `ER_LOCK_DEADLOCK` gap-lock deadlock. This is a
+property of driving `applyEventWithDedup` with real concurrency, not a
+defect in either test's synchronization, and `consumer.ts` was
+deliberately NOT changed to address it (out of this patch's bounded
+scope) -- both tests instead wrap their racing calls in a small,
+test-local retry-on-deadlock helper, which is MySQL's own documented
+response to a transient deadlock. Confirmed stable across 6 repeated
+full-file runs (2/2 passing each time) on both Node 22 and Node 24.
 
 ### Two local stacks can coexist on this host
 
@@ -532,12 +565,28 @@ were no longer the ones that were started).
 - **Records creation timestamp + executable path + a command-line
   marker**, specifically to detect PID reuse -- the one thing a bare
   PID cannot distinguish.
-- **Re-verifies identity immediately before terminating anything**:
-  re-reads the CURRENT process at the recorded PID and requires an
-  EXACT match on creation timestamp (changes instantly if the PID has
-  been reused) and that the current command line still contains the
-  recorded marker. Either check failing means the process is LEFT
-  RUNNING -- never killed on a guess.
+- **Validates identity INSIDE the termination action itself, on a
+  stable handle, not via a separate prior check** (Phase 3A.2
+  corrective patch): an earlier version of this module ran a SEPARATE
+  Bash-side identity check and then called the `stop` action with
+  nothing but a bare PID -- a genuine TOCTOU gap, since the OS could
+  reuse that PID between the two calls (or even inside `Stop-Process
+  -Id`'s own PID re-resolution) and termination would act on whatever
+  currently held it. Re-ordering the same check to run immediately
+  before `Stop-Process -Id` would NOT have closed this -- that cmdlet
+  still re-resolves the PID itself at the moment it runs. The caller's
+  expected identity (creation timestamp, executable path, command-line
+  marker) is now passed directly into ONE `stop` call, which obtains a
+  STABLE `[System.Diagnostics.Process]` handle via `GetProcessById`,
+  re-validates full identity against THAT SAME handle (case-insensitive,
+  trailing-slash-tolerant path comparison), and calls `.Kill()` on it --
+  never a second, unguarded PID resolution. A confirmed absence
+  (`GetProcessById` throws) reports `ALREADY_GONE`; an inspection/query
+  failure (the handle exists but WMI could not be read) reports
+  `QUERY_FAILED:...` and is NEVER treated as `ALREADY_GONE` or
+  `STOPPED`. Either check failing, or termination not confirmed within
+  the bound, means the process is LEFT RUNNING and the record is
+  retained -- never killed, or reported stopped, on a guess.
 - **Never kills by port.** There is no code path anywhere in this
   module that looks up "whatever is listening on port N."
 - **Verifies termination, not just that a kill signal was sent**:
@@ -568,13 +617,28 @@ its own. Fixed by redirecting to a FILE and reading it with `cat`
 piping directly.
 
 **Tested with an isolated fixture process, never a real user
-process** (`infra/k8s/scripts/lib/process-ownership.test.sh`, 6
-focused tests, all passing): a RelayLab-started fixture is stopped and
-confirmed dead; a stale record simulating PID reuse is refused and the
-real (unrelated) process survives untouched; a genuinely unrelated
-process running throughout cleanup is never touched; an already-exited
-owned process is handled as a safe no-op; a malformed/unidentifiable
-record is refused rather than reported successful.
+process** (`infra/k8s/scripts/lib/process-ownership.test.sh`, 11
+focused assertions, all passing, confirmed stable across repeated
+full-suite runs): a RelayLab-started fixture is stopped and confirmed
+dead; a stale record simulating PID reuse is refused and the real
+(unrelated) process survives untouched; a genuinely unrelated process
+running throughout cleanup is never touched; an already-exited owned
+process is handled as a safe no-op; a malformed/unidentifiable record
+is refused rather than reported successful; an executable/command-line
+mismatch (creation time unchanged) is refused with the real process
+surviving; an empty marker field is rejected outright before any
+termination attempt; a simulated identity/inspection query FAILURE
+retains the record and reports failure, never confused with confirmed
+absence, and is recorded in the recovery log; a simulated identity
+change between an earlier caller's own check and the actual
+termination boundary is refused, proving the boundary re-validates
+rather than trusting that earlier conclusion. Also smoke-tested against
+the real, live `kind` cluster's own port-forwards
+(`start-port-forwards.sh` / `stop-port-forwards.sh`): both tracked PIDs
+were confirmed listening on their ports before stop, identity-confirmed
+and killed via this module's `stop` action, and confirmed absent from
+both `netstat` and the process list afterward -- zero orphaned
+processes or listeners.
 
 ### A clock-display clarification, not a clock-drift bug
 
@@ -597,20 +661,48 @@ with a confirmed one.
 `npm run demo:fresh-schema` (`tests/integration/fresh-schema-verify.ts`)
 proves the migrations actually committed in THIS repository are
 sufficient on their own, independent of the existing demo database's
-own history. It creates its OWN, separately named, disposable database
-(`relaylab_fresh_verify` by default -- refuses to run against `relaylab`
-or `relaylab_test`), using the existing `applyMigrations` mechanism and
-its existing safety rule unchanged, then drops that database again at
-the end. Confirmed, in order: all 11 committed migration files
+own history.
+
+**CONFIRMED real defect, fixed in the Phase 3A.2 corrective patch**: the
+original version of this script was DESTRUCTIVE, not reproducible -- it
+ran `DROP DATABASE IF EXISTS` on an environment-selected name (via
+`RELAYLAB_FRESH_DB`) BEFORE `applyMigrations` performed any safety
+check, guarded only against that name being literally `relaylab` or
+`relaylab_test`. Any OTHER existing database passed through that
+override was silently destroyed first. The override is gone entirely.
+The script now always auto-generates a name under a strict, validated
+prefix (`relaylab_freshtest_<timestamp>_<random>`), validates both the
+identifier and the host (loopback-only: `127.0.0.1`/`localhost`/`::1`)
+BEFORE any DDL runs, and issues a bare `CREATE DATABASE` -- no
+`IF NOT EXISTS`, no preceding `DROP` -- which fails loudly on a
+collision, leaving the pre-existing database completely untouched.
+Cleanup acts ONLY on the literal `created: boolean` the creation call
+returned, never a re-derived guess: a failed create can never authorize
+dropping someone else's database, and a failure after a successful
+create drops only the database THIS invocation itself created.
+
+Confirmed, in order, on each run: all 11 committed migration files
 (0001-0010, 0012) apply cleanly on the first run; a second run against
 the same database applies zero new migrations (idempotent); both
 `publisher_leader` lock rows (`default`, `consumer-default`) exist
 after migrating; a representative task claim + command receipt via the
 real `TaskStore` succeeds; a representative publish-then-consume cycle
 via real NATS JetStream (an isolated namespace, never the shared dev
-one) ends with `event_count=1`. `relaylab`/`relaylab_test` were
-confirmed untouched throughout (checked via `SHOW DATABASES` before and
-after).
+one) ends with `event_count=1`; the run's own database and NATS stream
+are both dropped, and only those. `relaylab`/`relaylab_test` were
+confirmed untouched throughout.
+
+**6 new focused tests** (`tests/integration/fresh-schema-verify.test.ts`,
+all passing on Node 22 and Node 24), using isolated fixture databases,
+never risking `relaylab`/`relaylab_test`: an invalid identifier is
+rejected before any DDL; an unsafe (non-loopback) host is rejected
+before any DDL; a REAL existing database holding a sentinel row
+survives a name collision byte-for-byte; a failed create never
+authorizes cleanup of that existing database; a failure simulated AFTER
+a successful create cleans up only that run's own database while a
+separate, unrelated database present at the same time survives
+untouched; the full migrate/re-verify/cleanup path still works end to
+end on a freshly created, uniquely named database.
 
 **Provenance limitation, stated plainly, not invented around**: the
 existing demo database (`relaylab`) has a migration row named
