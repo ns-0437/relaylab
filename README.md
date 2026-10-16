@@ -68,6 +68,23 @@ The demo should report matching source/restored Git identities, distinct verific
 
 For setup details, Windows notes, configuration, and troubleshooting, see [Quickstart](docs/QUICKSTART.md). For the local cluster, follow [Kubernetes](docs/KUBERNETES.md).
 
+## AI repair mode
+
+An explicit second repair mode alongside the scripted one above: the worker asks Claude (via the official `@anthropic-ai/sdk`) to generate the fix for the same fixture's known bug, instead of applying a hardcoded substitution. The generated edit still goes through every existing guarantee -- the same worktree/identity checks, the same path-allowlisted commit, the same real Docker verification, the same durable checkpoint. It never checkpoints on a failed verification.
+
+Setup:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...   # read from the environment only; never hardcoded
+npm run demo:ai-repair -- --live      # the explicit opt-in a real, PAID API call requires
+```
+
+Without `--live` (or `RELAYLAB_AI_REPAIR_LIVE=1`), the demo makes no network call and prints what it would do -- this is also the default for `npm test`, which never spends tokens.
+
+Execution boundaries: at most 2 end-to-end attempts (generate -> commit -> verify); each provider call is bounded on input size, output tokens (`RELAYLAB_AI_MAX_OUTPUT_TOKENS`, default 2048), and wall-clock timeout (`RELAYLAB_AI_TIMEOUT_MS`, default 60000ms); the model is configurable (`RELAYLAB_AI_MODEL`, default `claude-opus-5-5`). The model can only produce a structured JSON edit for the one allowlisted file (`src/add.js`) -- there is no tool-use surface, so it cannot choose a shell command or any other path; tests, verification scripts, and configuration are always rejected. This does not claim exactly-once provider execution or a guaranteed billing cap -- see `tests/unit/ai-repair.test.ts` and `tests/integration/git-worker-ai.test.ts` for what is actually tested (with clearly labeled SIMULATED provider responses) and `src/worker/run-task-ai.ts` for the attempt-recording code.
+
+Inspecting evidence: each attempt's model, outcome, and token usage are printed by the demo and returned from `runAiRepairTask` -- never the prompt or raw response text. A successful run's checkpoint is queryable the same way the deterministic path's is (`task_checkpoints` / `command_receipts`, keyed by `checkpointCommandId(taskId)`).
+
 ## Break it deliberately
 
 ```bash

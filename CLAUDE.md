@@ -11,7 +11,59 @@ around cross-device coding agents. Not affiliated with Capy, does not
 reproduce proprietary internals, and does not claim to fix any specific
 unresolved Capy bug.
 
-## Current phase: Phase 3A.2 corrective patch (fixed a destructive fresh-schema drop-before-create, a TOCTOU gap at the process-termination boundary, and an inaccurately-labeled lease test) complete; Phase 3A.2 (process-ownership safety, precise consumer lease guarantee, fresh-schema reproducibility) complete; Phase 3A.1 (Kubernetes reliability patch -- re-entry safety, consumer exclusivity, dependency-aware readiness, port-forward hardening) complete; Phase 3A Part B (local Kubernetes deployment of the publisher/consumer against cluster MySQL/NATS) complete; Phase 3A Part A (post-verification input-integrity check) complete; Phase 2C correctness patch (cleanup contract, input-protection honesty, archive-attribute fix) complete; Phase 2C.1 (containerized-verification acceptance patch) complete; Phase 2C (containerized verification) complete; Phase 2B.2 (durable-command gap closure, handoff milestone finished) complete; Phase 2B.1 (handoff correctness patch) complete; Phase 2B (committed-checkpoint two-worker handoff) complete; Phase 2A.2 (workspace-classification + checkpoint-validation correctness patch) complete; Phase 2A.1 (committed-state reconciliation correctness patch) complete; Phase 2A (one real Git execution worker) complete; Phase 1.2.1 (OpenTelemetry + Prometheus/Grafana monitoring + reliability patch) complete
+## Current phase: AI repair milestone (one real AI-generated repair through the existing verification/checkpoint/handoff pipeline, bounded to 2 attempts, never bypassing identity/verification checks) complete; Phase 3A.2 corrective patch (fixed a destructive fresh-schema drop-before-create, a TOCTOU gap at the process-termination boundary, and an inaccurately-labeled lease test) complete; Phase 3A.2 (process-ownership safety, precise consumer lease guarantee, fresh-schema reproducibility) complete; Phase 3A.1 (Kubernetes reliability patch -- re-entry safety, consumer exclusivity, dependency-aware readiness, port-forward hardening) complete; Phase 3A Part B (local Kubernetes deployment of the publisher/consumer against cluster MySQL/NATS) complete; Phase 3A Part A (post-verification input-integrity check) complete; Phase 2C correctness patch (cleanup contract, input-protection honesty, archive-attribute fix) complete; Phase 2C.1 (containerized-verification acceptance patch) complete; Phase 2C (containerized verification) complete; Phase 2B.2 (durable-command gap closure, handoff milestone finished) complete; Phase 2B.1 (handoff correctness patch) complete; Phase 2B (committed-checkpoint two-worker handoff) complete; Phase 2A.2 (workspace-classification + checkpoint-validation correctness patch) complete; Phase 2A.1 (committed-state reconciliation correctness patch) complete; Phase 2A (one real Git execution worker) complete; Phase 1.2.1 (OpenTelemetry + Prometheus/Grafana monitoring + reliability patch) complete
+
+**AI repair milestone, this session**: one real AI-generated repair
+through the EXISTING reliability pipeline -- branched from PR #9's
+latest commit, kept separate. Adds exactly one provider adapter
+(`src/ai/anthropic-client.ts`, the official `@anthropic-ai/sdk`,
+credentials read from the environment only, model configurable via
+`RELAYLAB_AI_MODEL`) and one new repair mode
+(`src/worker/ai-repair.ts` + `src/worker/run-task-ai.ts`) alongside
+`repair.ts`'s existing deterministic one -- never replacing it.
+
+- **Same fixture, same single allowlisted file.** The model is given
+  the current content of the SAME `src/add.js` fixture
+  (`repair.ts`'s `TARGET_RELATIVE_PATH`) and asked to return one
+  structured JSON edit, no markdown, no explanation. There is no
+  tool-use surface in the request at all -- the model cannot choose a
+  shell command, a file path, or anything procedural; it can only
+  produce text, which `parseAndValidateEdits` then rejects unless it is
+  exactly one edit for exactly that one path. `commitAllowedPaths`
+  (the SAME primitive the deterministic path uses) enforces the
+  allowlist a SECOND time at the Git layer.
+- **Bounded, never bypassing the pipeline.** At most 2 end-to-end
+  attempts (generate -> commit -> real Docker verify); a failed
+  attempt's bounded, truncated stdout/stderr feeds the next attempt's
+  prompt; a request is bounded on output tokens and wall-clock timeout.
+  `run-task-ai.ts` reuses the SAME worktree/identity checks, the SAME
+  `materializeCandidateInput`/`verifyInDockerWithImageId` Docker
+  verification, and the SAME `buildManifest`/`publishCheckpoint`
+  checkpoint path `run-task.ts` uses -- nothing is bypassed or
+  weakened, and a checkpoint is never published for anything but a
+  genuinely passed verification.
+- **Paid calls require an explicit opt-in.** `npm run demo:ai-repair`
+  makes NO network call and spends nothing unless given `--live` (or
+  `RELAYLAB_AI_REPAIR_LIVE=1`). No test in this project's default
+  suites makes a real provider call.
+- **Tests use clearly labeled SIMULATED provider responses** (a fake
+  `MessagesClient`, never a real network call): `tests/unit/ai-repair.test.ts`
+  (parsing/validation, forbidden paths, malformed responses, a
+  simulated provider timeout, cancellation) and
+  `tests/integration/git-worker-ai.test.ts` (real Git/MySQL/Docker,
+  simulated provider: a valid edit checkpoints; every-attempt-rejected
+  exhaustion never checkpoints; a syntactically valid but wrong edit
+  fails real verification on both bounded attempts and never
+  checkpoints; a corrected retry succeeds). All pass on Node 24. No
+  live-provider smoke test was run against the real Anthropic API in
+  this session (no credentials were available) -- **live provider
+  unverified**; the adapter, config loading, and client construction
+  were confirmed to work with NO credentials present at all (per the
+  explicit constraint that missing credentials must never block the
+  adapter, tests, or documentation).
+- **Never logs prompts, responses, or API keys.** Attempt records
+  carry only model/outcome/reason/token-usage -- the prompt text and
+  raw response text are never persisted or logged anywhere.
 
 **Phase 3A Part A, this session**: closes the remaining input-integrity
 gap the Phase 2C correctness patch (below) explicitly narrowed rather
