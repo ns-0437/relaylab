@@ -29,7 +29,8 @@
     "test:docker-verify": "node --import tsx --test tests/integration/docker-verify.test.ts",
     "demo:k8s-messaging": "tsx tests/integration/demo-k8s-messaging.ts",
     "demo:fresh-schema": "tsx tests/integration/fresh-schema-verify.ts",
-    "demo:ai-repair": "tsx tests/integration/demo-ai-repair.ts"
+    "demo:ai-repair": "tsx tests/integration/demo-ai-repair.ts",
+    "demo:ui": "tsx src/api/server.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.135.0",
