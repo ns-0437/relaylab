@@ -335,3 +335,17 @@ export async function commitCountBetween(worktreeDir: string, from: string, to: 
 export async function resetHard(worktreeDir: string, commit: string, env: NodeJS.ProcessEnv): Promise<void> {
   await git(["reset", "--hard", commit], worktreeDir, env);
 }
+
+/**
+ * AI repair milestone: `git diff --name-only <from> <to>` -- the set of
+ * paths that differ between two COMMITS (not worktree status, which
+ * `changedPaths` above reports). Used to classify a reused worktree
+ * whose HEAD has already moved past the base commit: confirms the
+ * committed diff touches only the expected allowlisted path before
+ * trusting it as a resumable prior AI attempt, rather than assuming so
+ * from commit count alone.
+ */
+export async function changedPathsBetweenCommits(worktreeDir: string, from: string, to: string, env: NodeJS.ProcessEnv): Promise<string[]> {
+  const { stdout } = await git(["diff", "--name-only", `${from}..${to}`], worktreeDir, env);
+  return stdout.split("\n").filter((s) => s.length > 0);
+}
