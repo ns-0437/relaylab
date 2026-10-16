@@ -360,6 +360,45 @@ test_identity_change_between_check_and_termination() {
   fi
 }
 
+# --- Test 10: a probe proving .Handle (not GetProcessById alone, and
+# not .StartTime) is what actually pins a native handle open on THIS
+# runtime -- the mechanism process-ownership.ps1's `stop` action now
+# relies on to close the PID-reuse race. Not a test of po_stop itself
+# (test1 already covers that end to end); this isolates and directly
+# verifies the retention mechanism the fix depends on. ---
+test_handle_retention_probe() {
+  local name="t10-$$"
+  local record
+  record="$(start_fixture "$name")"
+  local pid
+  pid="$(grep '^PID=' "$record" 2>/dev/null | cut -d= -f2-)"
+  if [ -z "$pid" ]; then fail "test10: fixture failed to start"; return; fi
+
+  local out
+  out="$(powershell.exe -NoProfile -Command "
+    \$p = [System.Diagnostics.Process]::GetProcessById($pid)
+    try {
+      \$h1 = \$p.Handle
+      \$h2 = \$p.Handle
+      if (\$h1 -eq [IntPtr]::Zero -or \$h2 -eq [IntPtr]::Zero) { Write-Output 'NO_HANDLE'; return }
+      if (\$h1 -ne \$h2) { Write-Output 'NOT_RETAINED'; return }
+      if (\$p.SafeHandle.IsClosed) { Write-Output 'CLOSED_TOO_EARLY'; return }
+      Write-Output \"RETAINED_OPEN:\$h1\"
+    } finally {
+      \$p.Dispose()
+    }
+  " 2>&1 | tr -d '\r')"
+
+  if ! fixture_pid_alive "$record"; then
+    fail "test10: probing/disposing the handle must never affect the fixture's own liveness -- it is now gone"
+  elif echo "$out" | grep -q "RETAINED_OPEN:"; then
+    pass "test10: GetProcessById + explicit .Handle access retains the SAME open native handle across repeated reads (the mechanism the stop action's fix now relies on), without affecting the live process"
+  else
+    fail "test10: handle was NOT retained as expected -- got: $out"
+  fi
+  cleanup_pid "$pid"
+}
+
 test_start_then_stop
 test_stale_record_unrelated_process
 test_unrelated_listener_survives
@@ -369,6 +408,7 @@ test_exe_and_command_mismatch
 test_empty_marker_rejected
 test_query_failure_retains_record
 test_identity_change_between_check_and_termination
+test_handle_retention_probe
 
 echo "---"
 echo "tests passed: $PASS, failed: $FAIL"

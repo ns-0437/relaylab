@@ -85,19 +85,18 @@ switch ($Action) {
       return
     }
 
-    # Obtain a STABLE HANDLE to the process INSTANCE first, via .NET's
-    # own GetProcessById -- NOT Stop-Process -Id, which re-resolves the
-    # PID number at the moment it runs and would act on WHATEVER process
-    # currently holds that PID, including one that reused it after the
-    # original exited. A .NET Process object returned by GetProcessById
-    # is bound to the specific process INSTANCE the OS associated with
-    # this PID at the moment of the call; everything below (the WMI
-    # identity re-check AND the final Kill()) acts on or alongside THAT
-    # SAME object, not a PID number resolved a second time. Merely
-    # moving an identity check to run immediately before Stop-Process
-    # -Id would NOT close this gap -- Stop-Process -Id still re-resolves
-    # the PID itself, independent of whatever was checked a moment
-    # earlier. Using the handle is what actually does.
+    # GetProcessById ALONE does not pin anything -- verified directly on
+    # this runtime: the .NET Process object it returns, and even reading
+    # its .StartTime afterward, do NOT force an OS-level handle open and
+    # held for the object's lifetime (that part of the earlier comment
+    # here was wrong). Process's internal process handle is opened
+    # LAZILY, only when something that specifically needs it is
+    # accessed (EnsureState(HaveProcessHandle)), and .StartTime was
+    # found NOT to reliably trigger that on this runtime. Without an
+    # explicitly retained handle, the PID-reuse race this action exists
+    # to close is NOT actually closed by merely holding the wrapper
+    # object -- a reused PID could still be resolved fresh at Kill()
+    # time, identically to Stop-Process -Id's own re-resolution.
     #
     # GetProcessById throws when no process with this PID exists AT ALL
     # right now -- a CONFIRMED absence, correctly reported as
@@ -109,66 +108,99 @@ switch ($Action) {
       return
     }
 
-    # Re-query full identity (WMI; CommandLine is not available from the
-    # .NET Process object itself) for this exact PID, as close to the
-    # handle acquisition above as this script can get -- this IS the
-    # termination boundary's own validation, using the identity the
-    # CALLER expects, not a re-use of some earlier, separate check's
-    # conclusion.
-    $wmi = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue
-    if (-not $wmi) {
-      # The .NET handle says an instance with this PID exists, but WMI
-      # could not be queried right now -- an INSPECTION FAILURE, never
-      # treated as confirmed absence (ALREADY_GONE) or as a successful
-      # stop (STOPPED). The record is left in place by the bash caller
-      # on this outcome.
-      Write-Output "QUERY_FAILED:could not read WMI identity immediately before termination"
-      return
-    }
-
-    $actualCreated = $wmi.CreationDate.ToString('o')
-    $actualExe = $wmi.ExecutablePath
-    $actualCmdline = $wmi.CommandLine
-
-    $createdMatches = ($actualCreated -eq $ExpectedCreated)
-    # Windows executable-path comparison: case-insensitive (NTFS/the
-    # Windows API treat paths case-insensitively) and tolerant of a
-    # trailing separator -- appropriate Windows path semantics, not a
-    # byte-for-byte string match.
-    $exeMatches = $actualExe -and ($actualExe.TrimEnd('\') -ieq $ExpectedExe.TrimEnd('\'))
-    $markerMatches = $actualCmdline -and ($actualCmdline -like "*$ExpectedMarker*")
-
-    if (-not ($createdMatches -and $exeMatches -and $markerMatches)) {
-      Write-Output "IDENTITY_MISMATCH:created=$actualCreated|exe=$actualExe"
-      return
-    }
-
-    # One more, independent corroboration via the HANDLE's own StartTime
-    # (a different API/code path than the WMI query above) immediately
-    # before Kill() -- if the original instance has exited in the
-    # instant between the WMI check and here, this throws, and that is
-    # reported as a query failure (not a confirmed stop), never silently
-    # ignored.
     try {
-      $null = $proc.StartTime
+      # Explicitly force the native handle open and RETAINED on this
+      # SAME $proc instance, right now, by reading .Handle -- this is
+      # what actually triggers EnsureState(HaveProcessHandle) to call
+      # OpenProcess immediately and cache the resulting SafeHandle on
+      # $proc for the rest of this action. Once that handle is open,
+      # Windows cannot reassign this PID to a different process until
+      # the handle is closed (our `finally` below) -- THIS is what
+      # closes the PID-reuse race, not merely resolving the PID a
+      # second time, and not the StartTime read the previous version of
+      # this comment relied on. Everything below (the WMI identity
+      # re-check AND the final Kill()) acts on this SAME pinned
+      # instance.
+      $null = $proc.Handle
+    } catch [System.InvalidOperationException] {
+      # The Process component is no longer associated with a running
+      # process -- a CONFIRMED absence, discovered the instant this
+      # action tried to pin a handle to it.
+      Write-Output "ALREADY_GONE"
+      $proc.Dispose()
+      return
+    } catch [System.ComponentModel.Win32Exception] {
+      if ($_.Exception.NativeErrorCode -eq 87) {
+        # ERROR_INVALID_PARAMETER: OpenProcess failed because no process
+        # with this PID exists any more -- a CONFIRMED absence.
+        Write-Output "ALREADY_GONE"
+      } else {
+        # Any other Win32 failure (e.g. access denied) is an
+        # INSPECTION FAILURE, never confused with confirmed absence.
+        Write-Output "QUERY_FAILED:could not obtain a stable handle to pid $ProcessId -- $($_.Exception.Message)"
+      }
+      $proc.Dispose()
+      return
     } catch {
-      Write-Output "QUERY_FAILED:could not confirm the process handle was still valid immediately before termination"
+      Write-Output "QUERY_FAILED:could not obtain a stable handle to pid $ProcessId immediately before termination -- $($_.Exception.Message)"
+      $proc.Dispose()
       return
     }
 
     try {
-      $proc.Kill()
-    } catch {
-      Write-Output "ERROR:$($_.Exception.Message)"
-      return
-    }
+      # Re-query full identity (WMI; CommandLine is not available from
+      # the .NET Process object itself) for this exact PID -- this IS
+      # the termination boundary's own validation, using the identity
+      # the CALLER expects, not a re-use of some earlier, separate
+      # check's conclusion. The PID cannot have been reassigned since
+      # the handle above was pinned, so this still refers to the SAME
+      # instance $proc now holds open.
+      $wmi = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue
+      if (-not $wmi) {
+        # The pinned handle confirms an instance exists, but WMI could
+        # not be queried right now -- an INSPECTION FAILURE, never
+        # treated as confirmed absence (ALREADY_GONE) or as a
+        # successful stop (STOPPED). The record is left in place by the
+        # bash caller on this outcome.
+        Write-Output "QUERY_FAILED:could not read WMI identity immediately before termination"
+        return
+      }
 
-    $elapsed = 0
-    while ($elapsed -lt $TimeoutMs) {
-      Start-Sleep -Milliseconds 300
-      $elapsed += 300
-      if ($proc.HasExited) { Write-Output "STOPPED"; return }
+      $actualCreated = $wmi.CreationDate.ToString('o')
+      $actualExe = $wmi.ExecutablePath
+      $actualCmdline = $wmi.CommandLine
+
+      $createdMatches = ($actualCreated -eq $ExpectedCreated)
+      # Windows executable-path comparison: case-insensitive (NTFS/the
+      # Windows API treat paths case-insensitively) and tolerant of a
+      # trailing separator -- appropriate Windows path semantics, not a
+      # byte-for-byte string match.
+      $exeMatches = $actualExe -and ($actualExe.TrimEnd('\') -ieq $ExpectedExe.TrimEnd('\'))
+      $markerMatches = $actualCmdline -and ($actualCmdline -like "*$ExpectedMarker*")
+
+      if (-not ($createdMatches -and $exeMatches -and $markerMatches)) {
+        Write-Output "IDENTITY_MISMATCH:created=$actualCreated|exe=$actualExe"
+        return
+      }
+
+      # $proc's handle is the SAME one pinned above -- Kill() acts on
+      # that already-open handle, never a fresh PID resolution.
+      try {
+        $proc.Kill()
+      } catch {
+        Write-Output "ERROR:$($_.Exception.Message)"
+        return
+      }
+
+      $elapsed = 0
+      while ($elapsed -lt $TimeoutMs) {
+        Start-Sleep -Milliseconds 300
+        $elapsed += 300
+        if ($proc.HasExited) { Write-Output "STOPPED"; return }
+      }
+      Write-Output "STILL_RUNNING"
+    } finally {
+      $proc.Dispose()
     }
-    Write-Output "STILL_RUNNING"
   }
 }
