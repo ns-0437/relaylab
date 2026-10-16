@@ -11,7 +11,51 @@ around cross-device coding agents. Not affiliated with Capy, does not
 reproduce proprietary internals, and does not claim to fix any specific
 unresolved Capy bug.
 
-## Current phase: Phase 3A.2 corrective patch (fixed a destructive fresh-schema drop-before-create, a TOCTOU gap at the process-termination boundary, and an inaccurately-labeled lease test) complete; Phase 3A.2 (process-ownership safety, precise consumer lease guarantee, fresh-schema reproducibility) complete; Phase 3A.1 (Kubernetes reliability patch -- re-entry safety, consumer exclusivity, dependency-aware readiness, port-forward hardening) complete; Phase 3A Part B (local Kubernetes deployment of the publisher/consumer against cluster MySQL/NATS) complete; Phase 3A Part A (post-verification input-integrity check) complete; Phase 2C correctness patch (cleanup contract, input-protection honesty, archive-attribute fix) complete; Phase 2C.1 (containerized-verification acceptance patch) complete; Phase 2C (containerized verification) complete; Phase 2B.2 (durable-command gap closure, handoff milestone finished) complete; Phase 2B.1 (handoff correctness patch) complete; Phase 2B (committed-checkpoint two-worker handoff) complete; Phase 2A.2 (workspace-classification + checkpoint-validation correctness patch) complete; Phase 2A.1 (committed-state reconciliation correctness patch) complete; Phase 2A (one real Git execution worker) complete; Phase 1.2.1 (OpenTelemetry + Prometheus/Grafana monitoring + reliability patch) complete
+## Current phase: AI repair milestone (one real AI-generated repair through the existing verification/checkpoint/handoff pipeline, bounded to 2 attempts, never bypassing identity/verification checks) complete; Phase 3A.2 corrective patch (fixed a destructive fresh-schema drop-before-create, a TOCTOU gap at the process-termination boundary, and an inaccurately-labeled lease test) complete; Phase 3A.2 (process-ownership safety, precise consumer lease guarantee, fresh-schema reproducibility) complete; Phase 3A.1 (Kubernetes reliability patch -- re-entry safety, consumer exclusivity, dependency-aware readiness, port-forward hardening) complete; Phase 3A Part B (local Kubernetes deployment of the publisher/consumer against cluster MySQL/NATS) complete; Phase 3A Part A (post-verification input-integrity check) complete; Phase 2C correctness patch (cleanup contract, input-protection honesty, archive-attribute fix) complete; Phase 2C.1 (containerized-verification acceptance patch) complete; Phase 2C (containerized verification) complete; Phase 2B.2 (durable-command gap closure, handoff milestone finished) complete; Phase 2B.1 (handoff correctness patch) complete; Phase 2B (committed-checkpoint two-worker handoff) complete; Phase 2A.2 (workspace-classification + checkpoint-validation correctness patch) complete; Phase 2A.1 (committed-state reconciliation correctness patch) complete; Phase 2A (one real Git execution worker) complete; Phase 1.2.1 (OpenTelemetry + Prometheus/Grafana monitoring + reliability patch) complete
+
+**AI repair milestone, this session**: one real AI-generated repair
+through the EXISTING reliability pipeline (branched from PR #9's
+latest commit, kept separate) -- one provider adapter
+(`src/ai/anthropic-client.ts`) and one new repair mode
+(`src/worker/ai-repair.ts` + `src/worker/run-task-ai.ts`) alongside
+`repair.ts`'s existing deterministic one, never replacing it. Full
+setup, execution boundaries, and what is/isn't live-verified: see
+README.md "AI repair mode" -- not repeated here.
+
+A corrective pass this session fixed several real gaps found on
+review: identical/no-op model output now gets its own explicit
+`no_change` outcome (never an empty commit); the SDK's own retries are
+disabled (`maxRetries: 0`) so the 2-attempt bound also bounds real HTTP
+calls; an overall deadline and the caller's `AbortSignal` are combined
+and propagated into both the provider call and Docker verification,
+checked again immediately before applying an edit and before
+publishing; the task's claim lease is explicitly renewed before each
+attempt via TaskStore's own fencing (`renewLease`) -- on ownership loss
+the run stops immediately, never checkpointing; a reused worktree is
+now classified (ready / edit-pending-commit / committed / unexpected)
+instead of refusing every reuse outright, so an interrupted or
+committed-but-unpublished prior attempt resumes correctly without
+regenerating or double-publishing, while any genuinely unexpected
+modification is refused and left in place, never discarded; a
+symlinked repair target is rejected via `lstat` before being read or
+written; provider/parse error messages are sanitized to a fixed
+classification, never the raw response/prompt; and the model string
+now requires an explicit `RELAYLAB_AI_MODEL` (or
+`RELAYLAB_AI_ALLOW_DEFAULT_MODEL=1`) rather than silently falling back.
+The existing generic handoff APIs (`src/worker/handoff.ts`) were
+proven to work unmodified end to end from an AI-generated checkpoint
+through artifact/ownership-transfer/restore/re-verification/
+acknowledgement -- no parallel protocol was written.
+
+Tests (all SIMULATED-provider-labeled, all passing on Node 24):
+`tests/unit/ai-repair.test.ts`, `tests/unit/anthropic-client.test.ts`
+(a real SDK client against a local fake transport, proving the
+retry/timeout behavior above without any paid call), and
+`tests/integration/git-worker-ai.test.ts` (real Git/MySQL/Docker,
+including the full AI-edit-to-handoff-acknowledgement scenario). No
+live-provider smoke test ran this session (no credentials available)
+-- **live provider unverified**; adapter/config construction were
+confirmed to work with zero credentials present.
 
 **Phase 3A Part A, this session**: closes the remaining input-integrity
 gap the Phase 2C correctness patch (below) explicitly narrowed rather

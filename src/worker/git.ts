@@ -322,3 +322,30 @@ export async function commitCountBetween(worktreeDir: string, from: string, to: 
   }
   return n;
 }
+
+/**
+ * AI repair milestone: `git reset --hard <commit>` -- discards BOTH the
+ * current commit (moves HEAD back to `commit`) AND any uncommitted
+ * working-tree changes. Used only by run-task-ai.ts's bounded retry
+ * loop, to discard a failed attempt's committed (but verification-
+ * rejected) edit before generating and committing a fresh one against
+ * the same clean base -- never used by the deterministic repair path,
+ * which has no retry loop to reset between.
+ */
+export async function resetHard(worktreeDir: string, commit: string, env: NodeJS.ProcessEnv): Promise<void> {
+  await git(["reset", "--hard", commit], worktreeDir, env);
+}
+
+/**
+ * AI repair milestone: `git diff --name-only <from> <to>` -- the set of
+ * paths that differ between two COMMITS (not worktree status, which
+ * `changedPaths` above reports). Used to classify a reused worktree
+ * whose HEAD has already moved past the base commit: confirms the
+ * committed diff touches only the expected allowlisted path before
+ * trusting it as a resumable prior AI attempt, rather than assuming so
+ * from commit count alone.
+ */
+export async function changedPathsBetweenCommits(worktreeDir: string, from: string, to: string, env: NodeJS.ProcessEnv): Promise<string[]> {
+  const { stdout } = await git(["diff", "--name-only", `${from}..${to}`], worktreeDir, env);
+  return stdout.split("\n").filter((s) => s.length > 0);
+}

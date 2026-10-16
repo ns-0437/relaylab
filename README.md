@@ -68,6 +68,24 @@ The demo should report matching source/restored Git identities, distinct verific
 
 For setup details, Windows notes, configuration, and troubleshooting, see [Quickstart](docs/QUICKSTART.md). For the local cluster, follow [Kubernetes](docs/KUBERNETES.md).
 
+## AI repair mode
+
+An explicit second repair mode alongside the scripted one above: the worker asks Claude (via the official `@anthropic-ai/sdk`) to generate the fix for the same fixture's known bug, instead of applying a hardcoded substitution. The generated edit still goes through every existing guarantee -- the same worktree/identity checks, the same path-allowlisted commit, the same real Docker verification, the same durable checkpoint. It never checkpoints on a failed verification.
+
+Setup:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...        # read from the environment only; never hardcoded
+export RELAYLAB_AI_MODEL=claude-opus-5-5   # required explicitly for a live call (or RELAYLAB_AI_ALLOW_DEFAULT_MODEL=1)
+npm run demo:ai-repair -- --live           # the explicit opt-in a real, PAID API call requires
+```
+
+Without `--live` (or `RELAYLAB_AI_REPAIR_LIVE=1`), the demo makes no network call and prints what it would do -- this is also the default for `npm test`, which never spends tokens.
+
+Execution boundaries: at most 2 end-to-end attempts (generate -> commit -> real Docker verify), bounded by an overall deadline (`DEFAULT_OVERALL_DEADLINE_MS`, 100s) comfortably inside the project's existing 120s task-claim lease, which is explicitly renewed before each attempt -- if ownership is lost mid-run (another owner takes over, or the epoch moves), the run stops immediately via TaskStore's own fencing, never checkpointing. Each provider call disables the SDK's own retries (`maxRetries: 0`, so the 2-attempt bound also bounds real HTTP calls) and is bounded on output tokens (`RELAYLAB_AI_MAX_OUTPUT_TOKENS`, default 2048, ceiling 8192) and timeout (`RELAYLAB_AI_TIMEOUT_MS`, default 60000ms, ceiling 180000ms). The model can only produce a structured JSON edit for the one allowlisted file (`src/add.js`) -- there is no tool-use surface, so it cannot choose a shell command or any other path; tests, verification scripts, configuration, and symlinked repair targets are always rejected, and identical (no-op) output is its own explicit outcome, never an empty commit. A restart that finds an already-committed-but-unverified or interrupted-but-validated prior attempt resumes it directly rather than regenerating; any OTHER unexpected workspace modification is refused, never discarded. Checkpoints from this mode feed the SAME handoff/artifact/restore-acknowledgement path the deterministic mode uses, unmodified. This does not claim exactly-once provider execution or a guaranteed billing cap -- see `tests/unit/ai-repair.test.ts`, `tests/unit/anthropic-client.test.ts` (a real SDK client against a local fake transport, proving the retry/timeout behavior above), and `tests/integration/git-worker-ai.test.ts` (including the full AI-edit-to-handoff-acknowledgement scenario) for what is actually tested, all with clearly labeled SIMULATED provider responses.
+
+Inspecting evidence: each attempt's model, outcome, and token usage are printed by the demo and returned from `runAiRepairTask` -- never the prompt or raw response text. A successful run's checkpoint is queryable the same way the deterministic path's is (`task_checkpoints` / `command_receipts`, keyed by `checkpointCommandId(taskId)`).
+
 ## Break it deliberately
 
 ```bash
