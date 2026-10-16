@@ -226,12 +226,12 @@ test("a malformed event is dead-lettered instead of blocking the stream forever"
 });
 
 test(
-  "a transient MySQL deadlock during applyEventWithDedup is not acked as successful, and is recovered " +
-    "entirely through the REAL delivery path (handleMessage + broker redelivery) once the fault clears -- " +
-    "no test-only retry wrapper involved. Controlled, deterministic fault injection: the pool's own " +
+  "injected deadlock-shaped failure, transaction rollback, no successful ACK, then explicit NAK and " +
+    "broker redelivery, recovered through the REAL delivery path (handleMessage), not the test-only " +
+    "retry wrapper used elsewhere. Controlled, deterministic fault injection: the pool's own " +
     "getConnection is wrapped to make exactly ONE INSERT INTO consumer_processed throw a real " +
-    "ER_LOCK_DEADLOCK-shaped error, simulating a genuine transient InnoDB deadlock without needing an " +
-    "actual concurrent race.",
+    "ER_LOCK_DEADLOCK-shaped error. Redelivery here is forced explicitly via msg.nak() -- this does NOT " +
+    "exercise or claim to have tested automatic ack_wait timeout expiry.",
   async () => {
     const taskId = uniqueId("task");
     await publishOneCheckpointEvent(taskId);
