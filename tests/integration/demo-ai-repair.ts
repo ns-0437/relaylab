@@ -31,6 +31,13 @@ async function main() {
     console.log("[demo-ai-repair] This is the required opt-in boundary for a real, paid Anthropic API call -- see README.md 'AI repair mode'.");
     return;
   }
+  if (!process.env.RELAYLAB_AI_MODEL && process.env.RELAYLAB_AI_ALLOW_DEFAULT_MODEL !== "1") {
+    console.error(
+      "[demo-ai-repair] RELAYLAB_AI_MODEL must be set explicitly for a live call (or set RELAYLAB_AI_ALLOW_DEFAULT_MODEL=1 to use the verified default) -- see README.md 'AI repair mode'.",
+    );
+    process.exitCode = 1;
+    return;
+  }
 
   const demoRoot = await mkdtemp(path.join(tmpdir(), "relaylab-ai-repair-demo-"));
   const fixtureDir = path.join(demoRoot, "fixture-repo");
