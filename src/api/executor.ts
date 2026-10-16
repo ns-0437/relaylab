@@ -30,6 +30,7 @@ import { prepareHandoffArtifact, requestOwnershipTransfer, restoreAndAcknowledge
 import { insertRun, updateRunStatus, type RunDetail, type RunMode } from "./runs-store.js";
 
 export class RunConflictError extends Error {}
+export class AdmissionBlockedError extends Error {}
 export class LiveModeDisabledError extends Error {}
 /** Carries a SANITIZED, fixed error code -- never a raw message built from an arbitrary caught error. See classifyError below. */
 export class RunStartError extends Error {
@@ -49,6 +50,25 @@ let active: ActiveRun | null = null;
 
 export function activeRunId(): string | null {
   return active?.runId ?? null;
+}
+
+/**
+ * Blocked permanently once set -- used when this process can no longer
+ * establish ownership of the singleton lock (confirmed loss, or the
+ * conservative expiry watchdog), and during graceful shutdown. A
+ * STALE instance that has lost the lock must never admit a new run
+ * (which would let it overwrite a SUCCESSOR instance's lifecycle
+ * state in demo_runs) -- there is no "unblock" function; a new process
+ * is required.
+ */
+let admissionBlocked = false;
+export function blockAdmission(): void {
+  admissionBlocked = true;
+}
+
+/** Aborts the currently active run's controller, if any -- used when the singleton lock is confirmed lost, so a stale instance's execution stops promptly rather than running to completion and overwriting a successor's view of demo_runs. */
+export function cancelActiveRunForLockLoss(): void {
+  active?.controller.abort();
 }
 
 /** Awaited by graceful shutdown. Resolves immediately if nothing is active. */
@@ -121,14 +141,24 @@ function classifyError(err: unknown): { code: string; message: string } {
  * requested live run to simulated on any failure of that check; it
  * refuses outright.
  *
- * The in-memory `active` reservation is held ONLY once this call has
- * fully committed to running (after the durable `insertRun` write
- * succeeds) -- if that write itself fails, the reservation this call
- * made is released before the error propagates, so a transient storage
- * failure can never leave the demo permanently unable to start a new
- * run.
+ * CONFIRMED real defect, fixed here: `active` used to be set only AFTER
+ * `await insertRun(...)` resolved, leaving a window where two
+ * concurrent calls could both pass the `if (active)` check above and
+ * both proceed to insert/execute. `active` is now reserved
+ * SYNCHRONOUSLY, as the very next statement after that check and
+ * BEFORE this function's first `await` -- a second concurrent call
+ * cannot observe `active` as unset once the first call's synchronous
+ * prefix has run, which JavaScript's own run-to-completion semantics
+ * guarantee happens before the second call's own synchronous prefix
+ * ever starts. The reservation's own `promise` field covers BOTH the
+ * pending-insertion window and (once insertion succeeds) real
+ * execution, so a failed insertion still releases it correctly, and
+ * `awaitActiveRun` (graceful shutdown) can await either phase.
  */
 export async function startRun(pool: mysql.Pool, mode: RunMode, confirmPaidCall: boolean): Promise<{ runId: string }> {
+  if (admissionBlocked) {
+    throw new AdmissionBlockedError("this server instance can no longer establish ownership of the singleton lock (or is shutting down) -- refusing to start a new run");
+  }
   if (active) {
     throw new RunConflictError(`a run (${active.runId}) is already active -- this demo supports one active run at a time; cancel it first or wait for it to finish`);
   }
@@ -150,24 +180,33 @@ export async function startRun(pool: mysql.Pool, mode: RunMode, confirmPaidCall:
   const runId = `run-${randomUUID()}`;
   const taskId = `demo-task-${randomUUID()}`;
   const ownerId = `demo-api-${runId}`;
+  const controller = new AbortController();
+
+  // One stable promise covers insertion AND execution. Shutdown may already
+  // be awaiting this promise while insertion is pending; never replace it.
+  let releasePending: () => void;
+  const reservation: ActiveRun = { runId, controller, promise: new Promise<void>((resolve) => (releasePending = resolve)) };
+  active = reservation;
 
   try {
     await insertRun(pool, { runId, taskId, mode, status: "starting", ownerId, detail: { stage: "generation" } });
   } catch (err) {
-    // No reservation was ever made for this failed start -- `active`
-    // was never set, so there is nothing to release. This IS the fix:
-    // the reservation below is created only AFTER this write succeeds.
+    // Release ONLY this reservation -- and only if it is STILL the
+    // active one (defensive; nothing else can legitimately have
+    // replaced it mid-insert, but never clear a DIFFERENT reservation
+    // by accident).
+    if (active === reservation) active = null;
+    releasePending!();
     const classified = classifyError(err);
     throw new RunStartError(classified.code, classified.message);
   }
 
-  const controller = new AbortController();
-  const promise = executeRun(pool, runId, taskId, ownerId, mode, controller.signal).catch(() => {
+  const execPromise = executeRun(pool, runId, taskId, ownerId, mode, controller.signal).catch(() => {
     /* executeRun itself records failures into demo_runs; nothing further to do here. */
   });
-  active = { runId, controller, promise };
-  void promise.finally(() => {
-    if (active?.runId === runId) active = null;
+  void execPromise.finally(() => {
+    if (active === reservation) active = null;
+    releasePending!();
   });
 
   return { runId };
@@ -182,6 +221,10 @@ export function cancelRun(runId: string): void {
 
 async function executeRun(pool: mysql.Pool, runId: string, taskId: string, ownerId: string, mode: RunMode, signal: AbortSignal): Promise<void> {
   try {
+    if (signal.aborted) {
+      await updateRunStatus(pool, runId, "cancelled", { stage: "generation" });
+      return;
+    }
     await updateRunStatus(pool, runId, "running", { stage: "generation" });
 
     // Temporary-directory setup is now INSIDE the guarded lifecycle --
@@ -363,14 +406,27 @@ async function executeRun(pool: mysql.Pool, runId: string, taskId: string, owner
     });
   } catch (err) {
     const classified = classifyError(err);
-    await updateRunStatus(pool, runId, signal.aborted ? "cancelled" : "failed", { error: `${classified.code}: ${classified.message}` }).catch(() => {
-      // A failure to even PERSIST the failure must not throw out of
-      // this catch block uncaught (that would be an unhandled
-      // rejection in the detached executeRun promise) -- but it is
-      // also never silently treated as success; the run simply stays
-      // at whatever status it last reached, which reconcileOnStartup
-      // will correctly mark "interrupted" on the next restart if this
-      // process dies before recovering.
-    });
+    try {
+      await updateRunStatus(pool, runId, signal.aborted ? "cancelled" : "failed", { error: `${classified.code}: ${classified.message}` });
+    } catch {
+      // A failure to even PERSIST the terminal status must not throw
+      // out of this catch block uncaught (that would be an unhandled
+      // rejection in the detached executeRun promise) -- but it is also
+      // never silently treated as success. Recorded in-memory as a
+      // SANITIZED degraded marker (never the raw error) so GET
+      // /api/runs/:id can surface "this run's true final status could
+      // not be durably recorded" instead of showing a stale
+      // "running"/"transferring" row with no explanation. Cleared once
+      // storage recovers and reconcileOnStartup runs on the NEXT
+      // restart (the authoritative recovery path); this marker is only
+      // ever a same-process, same-run, best-effort annotation.
+      degradedRuns.set(runId, "this run's terminal status could not be durably recorded -- the database write itself failed after the run finished");
+    }
   }
+}
+
+/** Sanitized, in-memory ONLY -- never a substitute for the durable demo_runs row, which remains the authoritative source once storage recovers. See the catch block above. */
+const degradedRuns = new Map<string, string>();
+export function degradedRunNote(runId: string): string | undefined {
+  return degradedRuns.get(runId);
 }
