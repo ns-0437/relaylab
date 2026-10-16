@@ -86,6 +86,36 @@ Execution boundaries: at most 2 end-to-end attempts (generate -> commit -> real 
 
 Inspecting evidence: each attempt's model, outcome, and token usage are printed by the demo and returned from `runAiRepairTask` -- never the prompt or raw response text. A successful run's checkpoint is queryable the same way the deterministic path's is (`task_checkpoints` / `command_receipts`, keyed by `checkpointCommandId(taskId)`).
 
+## Demo UI
+
+A small local HTTP API (`src/api/`, plain `node:http`, no web framework) plus a static React UI (`ui/`, React loaded via CDN script tags, no build step), so the pipeline above is clickable rather than CLI-only. This is a **local, single-process, one-run-at-a-time demo** -- never a distributed job queue -- and it makes **no real API calls unless you explicitly enable live mode**.
+
+```bash
+docker compose -f infra/compose.yaml up -d --wait mysql nats
+npm run docker:build-verify-image   # once, if not already built
+npm run migrate                     # applies 0013_demo_runs.sql among others
+npm run demo:ui                     # starts the API + serves the UI
+```
+
+Open **http://127.0.0.1:4555** (binds to loopback only by default; override with `RELAYLAB_API_HOST`/`RELAYLAB_API_PORT`). Pick a mode, click **Start run**, and watch the stage timeline (Generation -> Verification -> Checkpoint -> Transfer -> Restore/Ack) advance via 2-second polling against `GET /api/runs/:id` -- every stage shown is read from the `demo_runs` table (a durable row, not a local timer), including the actual model used, token usage, commit/tree identifiers, and a "MATCHES" check between worker A's result and worker B's independently restored/re-verified result.
+
+**Modes:**
+- **AI repair -- SIMULATED provider** (default): no network call, no cost, real Git/Docker/MySQL/handoff throughout.
+- **Deterministic scripted repair**: no AI at all, same pipeline.
+- **AI repair -- LIVE provider**: disabled unless the server is started with `RELAYLAB_LIVE_MODE=1` AND `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` AND `RELAYLAB_AI_MODEL` are all set, AND the UI's confirmation checkbox ("I understand this will make a real Anthropic API call and incur real charges") is checked for that specific request. A failed live call is reported as a failure -- it is never silently replaced with simulated output.
+
+**API:** `POST /api/runs {mode, confirmPaidCall?}`, `GET /api/runs`, `GET /api/runs/:id`, `POST /api/runs/:id/cancel`. Mutations require `Content-Type: application/json`; a browser `Origin` header that isn't this server's own loopback origin is rejected (403); only the fixed mode allowlist is ever accepted -- never a repository path, shell command, or provider URL. A second `POST /api/runs` while one is active returns 409. Credentials are never included in any response.
+
+**Restart behavior:** on startup, the server reconciles `demo_runs`: any row left in an in-flight status by a prior process is marked `interrupted` -- there is no way for this single-process model to resume an in-flight JS execution across a restart, and a dead process is never displayed as still running.
+
+**Tests:** `tests/integration/api.test.ts` (invalid input, untrusted origin, live-mode opt-in enforcement, overlapping starts, cancellation, 404/200 detail lookup -- against the disposable `relaylab_test` database, never the dev database a running demo uses) and a real **browser-driven** workflow (started via the Start-run button, polled through the UI to a completed run showing matching A/B commit identity and a confirmed restore acknowledgement, plus a Cancel-button run correctly reported as `verification_cancelled`) -- see "Current limitations" below for what that covered and didn't.
+
+**Current limitations:**
+- No build step for the UI (plain JS + CDN React) -- a deliberate simplification for this milestone, not a production asset pipeline; it requires network access to load React itself.
+- No authentication -- loopback-only binding and origin checking are the only access controls; do not expose this port beyond localhost.
+- Single active run, single process, no persistence of the AbortController across a restart -- by design, stated as the local execution model this is, not a limitation to be read as a bug.
+- The one browser-driven automated check in this repository exercised the success path and a cancellation path manually via the built-in browser tool during development; it is not yet wired into `npm test` as a headless browser suite.
+
 ## Break it deliberately
 
 ```bash
