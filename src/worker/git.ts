@@ -322,3 +322,16 @@ export async function commitCountBetween(worktreeDir: string, from: string, to: 
   }
   return n;
 }
+
+/**
+ * AI repair milestone: `git reset --hard <commit>` -- discards BOTH the
+ * current commit (moves HEAD back to `commit`) AND any uncommitted
+ * working-tree changes. Used only by run-task-ai.ts's bounded retry
+ * loop, to discard a failed attempt's committed (but verification-
+ * rejected) edit before generating and committing a fresh one against
+ * the same clean base -- never used by the deterministic repair path,
+ * which has no retry loop to reset between.
+ */
+export async function resetHard(worktreeDir: string, commit: string, env: NodeJS.ProcessEnv): Promise<void> {
+  await git(["reset", "--hard", commit], worktreeDir, env);
+}
