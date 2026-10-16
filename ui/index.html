@@ -4,50 +4,13 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>RelayLab -- AI Repair Demo</title>
-<style>
-  :root { color-scheme: light dark; }
-  body { font-family: system-ui, -apple-system, sans-serif; margin: 0; padding: 0 0 3rem; background: #0e1116; color: #e6e6e6; }
-  header { padding: 1rem 1.5rem; border-bottom: 1px solid #2a2f3a; display: flex; align-items: center; justify-content: space-between; }
-  h1 { font-size: 1.1rem; margin: 0; }
-  main { max-width: 980px; margin: 0 auto; padding: 1.5rem; display: grid; gap: 1.5rem; }
-  section { background: #161b22; border: 1px solid #2a2f3a; border-radius: 8px; padding: 1rem 1.25rem; }
-  h2 { font-size: 0.95rem; margin: 0 0 0.75rem; color: #9fb3c8; text-transform: uppercase; letter-spacing: 0.04em; }
-  label { display: block; font-size: 0.85rem; margin-bottom: 0.3rem; color: #c3cad4; }
-  select, button, input[type="checkbox"] { font-size: 0.9rem; }
-  select { background: #0e1116; color: #e6e6e6; border: 1px solid #39414f; border-radius: 4px; padding: 0.4rem; }
-  button { background: #2563eb; color: white; border: none; border-radius: 4px; padding: 0.5rem 0.9rem; cursor: pointer; }
-  button:disabled { background: #39414f; cursor: not-allowed; }
-  button.secondary { background: #39414f; }
-  button:focus-visible, select:focus-visible, a:focus-visible { outline: 2px solid #60a5fa; outline-offset: 2px; }
-  .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 12px; font-size: 0.75rem; font-weight: 600; }
-  .badge.simulated { background: #1f3a2a; color: #7ee2a8; }
-  .badge.live { background: #3a1f1f; color: #f87171; }
-  .badge.deterministic { background: #1f2d3a; color: #7ec4f0; }
-  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
-  th, td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid #2a2f3a; }
-  tr.selected { background: #1c2430; }
-  tr:hover { cursor: pointer; background: #1a2027; }
-  .stage-row { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 1rem; }
-  .stage { padding: 0.4rem 0.7rem; border-radius: 4px; font-size: 0.8rem; border: 1px solid #39414f; }
-  .stage.done { background: #1f3a2a; border-color: #2d5a3d; color: #7ee2a8; }
-  .stage.active { background: #1f2d3a; border-color: #3b6ea5; color: #7ec4f0; }
-  .stage.failed { background: #3a1f1f; border-color: #5a2d2d; color: #f87171; }
-  .stage.pending { color: #6b7280; }
-  .mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.8rem; word-break: break-all; }
-  .error-box { background: #2a1414; border: 1px solid #5a2d2d; color: #f8b4b4; padding: 0.6rem; border-radius: 4px; font-size: 0.85rem; white-space: pre-wrap; }
-  .empty { color: #6b7280; font-size: 0.85rem; }
-  .field { margin-bottom: 0.75rem; }
-  .hint { color: #8b95a3; font-size: 0.78rem; margin-top: 0.3rem; }
-</style>
+<link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
 <header>
   <h1>RelayLab -- AI Repair Demo</h1>
-  <span id="live-mode-badge" class="empty">checking server...</span>
 </header>
 <main id="root"></main>
-<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-<script src="/app.js"></script>
+<script type="module" src="/app.js"></script>
 </body>
 </html>

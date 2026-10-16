@@ -9,7 +9,9 @@
   "scripts": {
     "check:publication": "node scripts/check-publication.mjs",
     "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.typecheck.json",
+    "typecheck": "tsc -p tsconfig.typecheck.json && npm run typecheck:ui",
+    "typecheck:ui": "tsc -p ui/tsconfig.json",
+    "build:ui": "node scripts/build-ui.mjs",
     "test:unit": "node --import tsx --test tests/unit/**/*.test.ts",
     "test:integration": "node --import tsx --test --test-concurrency=1 tests/integration/**/*.test.ts",
     "migrate": "tsx src/db/migrate-cli.ts",
@@ -30,7 +32,7 @@
     "demo:k8s-messaging": "tsx tests/integration/demo-k8s-messaging.ts",
     "demo:fresh-schema": "tsx tests/integration/fresh-schema-verify.ts",
     "demo:ai-repair": "tsx tests/integration/demo-ai-repair.ts",
-    "demo:ui": "tsx src/api/server.ts"
+    "demo:ui": "npm run build:ui && tsx src/api/server.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.135.0",
@@ -50,6 +52,11 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.1",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "esbuild": "^0.28.2",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   }
