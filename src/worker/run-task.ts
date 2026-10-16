@@ -92,6 +92,10 @@ export interface RunTaskArgs {
   pool: mysql.Pool;
   /** Test-only escape hatch: skip the scripted repair so verification genuinely fails against the unrepaired fixture -- see tests/integration/git-worker.test.ts "verification failure prevents successful completion." Never used by src/worker-main.ts's real path. */
   skipRepairForTesting?: boolean;
+  /** Demo UI milestone: propagated into Docker verification (VerificationRequest.signal, already supported there) so a caller (e.g. the local demo API's cancel button) can cancel an in-flight deterministic verification, not only the AI path's. Optional -- every existing caller that omits it is unaffected. */
+  signal?: AbortSignal;
+  /** Test-only deterministic barrier: invoked at the exact moment the verification container is confirmed running (the SAME real signal process-ownership-style failpoints already use), so a cancellation test can abort precisely then -- never a sleep-based guess. Never used by any real caller. */
+  onVerifyContainerCreated?: (containerId: string) => void | Promise<void>;
 }
 
 /**
@@ -186,10 +190,16 @@ export async function runGitWorkerTask(args: RunTaskArgs): Promise<RunOutcome> {
             // reach the checkpoint step below.
             assertMaterializedTreeMatches(materialized, pinnedTree, `task ${args.taskId}`);
             return await verifyInDockerWithImageId(
-              { taskId: args.taskId, attemptId, inputDir: materialized.exportDir },
+              { taskId: args.taskId, attemptId, inputDir: materialized.exportDir, ...(args.signal ? { signal: args.signal } : {}) },
               {
-                onContainerCreated: (containerId) =>
-                  hitFailpoint("worker-verify-container-running", { pid: process.pid, containerId, taskId: args.taskId, attemptId, epoch: args.epoch }),
+                onContainerCreated: async (containerId) => {
+                  await hitFailpoint("worker-verify-container-running", { pid: process.pid, containerId, taskId: args.taskId, attemptId, epoch: args.epoch });
+                  // Test-only deterministic barrier: fires at the REAL
+                  // moment Docker confirms the verification container is
+                  // running, never a sleep -- see
+                  // tests/integration/cancellation-barriers.test.ts.
+                  await args.onVerifyContainerCreated?.(containerId);
+                },
               },
             );
           } finally {

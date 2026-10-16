@@ -101,6 +101,10 @@ export async function restoreAndAcknowledge(
     manifestPath: string;
     destRepoDir: string;
     env: NodeJS.ProcessEnv;
+    /** Demo UI milestone: propagated into B's Docker re-verification. Checked again, explicitly, immediately before the acknowledgement write below -- but NEVER after that write succeeds: a durably recorded acknowledgement is never retroactively treated as cancelled. */
+    signal?: AbortSignal;
+    /** Test-only deterministic barrier: invoked at the exact moment B's re-verification container is confirmed running -- never a sleep-based guess. Never used by any real caller. */
+    onVerifyContainerCreated?: (containerId: string) => void | Promise<void>;
   },
 ): Promise<RestoreOutcome> {
   const tracer = getTracer();
@@ -149,7 +153,16 @@ export async function restoreAndAcknowledge(
             // DIFFERENT tree than the one it just restored authorize a
             // restoration acknowledgement.
             assertMaterializedTreeMatches(materialized, restoredTree, `task ${args.taskId} handoff ${args.handoffId}`);
-            return await verifyInDockerWithImageId({ taskId: args.taskId, attemptId: args.handoffId, inputDir: materialized.exportDir });
+            return await verifyInDockerWithImageId(
+              { taskId: args.taskId, attemptId: args.handoffId, inputDir: materialized.exportDir, ...(args.signal ? { signal: args.signal } : {}) },
+              {
+                onContainerCreated: async (containerId) => {
+                  // Test-only deterministic barrier -- see
+                  // tests/integration/cancellation-barriers.test.ts.
+                  await args.onVerifyContainerCreated?.(containerId);
+                },
+              },
+            );
           } finally {
             await materialized.cleanup();
           }
@@ -173,6 +186,17 @@ export async function restoreAndAcknowledge(
       if (verification.outcome !== "passed") {
         span.setAttribute("relaylab.outcome", "verification_failed");
         return { kind: "verification_failed", verification };
+      }
+
+      // Checked explicitly HERE, one last time -- re-verification
+      // genuinely passed, but if cancellation arrived during it, the
+      // acknowledgement write below must not happen. This check is
+      // NEVER repeated after the write below succeeds: a durably
+      // recorded acknowledgement is never retroactively undone or
+      // reported as cancelled.
+      if (args.signal?.aborted) {
+        span.setAttribute("relaylab.outcome", "verification_cancelled");
+        return { kind: "verification_cancelled", verification };
       }
 
       const receipt = await tracer.startActiveSpan("relaylab.handoff.acknowledge_restore", async (s) => {
