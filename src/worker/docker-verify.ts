@@ -829,6 +829,19 @@ export async function verifyInDocker(request: VerificationRequest, options: Dock
   const timeoutMs = request.timeoutMs ?? DEFAULT_VERIFY_TIMEOUT_MS;
   type RaceResult = { kind: "exited"; code: number } | { kind: "timed_out" } | { kind: "cancelled" } | { kind: "container_exited_unexpectedly"; code: number | null };
   const race = await new Promise<RaceResult>((resolve) => {
+    // CONFIRMED real defect, fixed here: `addEventListener("abort", ...)`
+    // never fires for a signal that was ALREADY aborted before this
+    // listener was added -- the DOM "abort" event is a one-shot
+    // dispatch at the moment `.abort()` is called, not a retroactive
+    // check of current state. Without this guard, a caller that passed
+    // an already-cancelled signal (e.g. cancellation requested while
+    // this function was still materializing the candidate, before
+    // verification itself ever started) would have this race silently
+    // ignore that and let verification run to completion normally.
+    if (request.signal?.aborted) {
+      resolve({ kind: "cancelled" });
+      return;
+    }
     const timer = setTimeout(() => resolve({ kind: "timed_out" }), timeoutMs);
     timer.unref();
     const onAbort = () => resolve({ kind: "cancelled" });
