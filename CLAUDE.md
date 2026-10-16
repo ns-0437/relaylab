@@ -11,23 +11,43 @@ around cross-device coding agents. Not affiliated with Capy, does not
 reproduce proprietary internals, and does not claim to fix any specific
 unresolved Capy bug.
 
-## Current phase: Demo UI (local HTTP API + static React UI over the AI repair pipeline, one run at a time, simulated by default) complete; AI repair milestone (one real AI-generated repair through the existing verification/checkpoint/handoff pipeline, bounded to 2 attempts, never bypassing identity/verification checks) complete; Phase 3A.2 corrective patch (fixed a destructive fresh-schema drop-before-create, a TOCTOU gap at the process-termination boundary, and an inaccurately-labeled lease test) complete; Phase 3A.2 (process-ownership safety, precise consumer lease guarantee, fresh-schema reproducibility) complete; Phase 3A.1 (Kubernetes reliability patch -- re-entry safety, consumer exclusivity, dependency-aware readiness, port-forward hardening) complete; Phase 3A Part B (local Kubernetes deployment of the publisher/consumer against cluster MySQL/NATS) complete; Phase 3A Part A (post-verification input-integrity check) complete; Phase 2C correctness patch (cleanup contract, input-protection honesty, archive-attribute fix) complete; Phase 2C.1 (containerized-verification acceptance patch) complete; Phase 2C (containerized verification) complete; Phase 2B.2 (durable-command gap closure, handoff milestone finished) complete; Phase 2B.1 (handoff correctness patch) complete; Phase 2B (committed-checkpoint two-worker handoff) complete; Phase 2A.2 (workspace-classification + checkpoint-validation correctness patch) complete; Phase 2A.1 (committed-state reconciliation correctness patch) complete; Phase 2A (one real Git execution worker) complete; Phase 1.2.1 (OpenTelemetry + Prometheus/Grafana monitoring + reliability patch) complete
+## Current phase: Demo UI release-readiness pass (reservation-leak/stage-accuracy fixes, cancellation propagated into deterministic+restore verification, a DB-backed singleton lock, graceful shutdown, TypeScript+React frontend bundled locally) complete; Demo UI (local HTTP API + React UI over the AI repair pipeline, one run at a time, simulated by default) complete; AI repair milestone (one real AI-generated repair through the existing verification/checkpoint/handoff pipeline, bounded to 2 attempts, never bypassing identity/verification checks) complete; Phase 3A.2 corrective patch (fixed a destructive fresh-schema drop-before-create, a TOCTOU gap at the process-termination boundary, and an inaccurately-labeled lease test) complete; Phase 3A.2 (process-ownership safety, precise consumer lease guarantee, fresh-schema reproducibility) complete; Phase 3A.1 (Kubernetes reliability patch -- re-entry safety, consumer exclusivity, dependency-aware readiness, port-forward hardening) complete; Phase 3A Part B (local Kubernetes deployment of the publisher/consumer against cluster MySQL/NATS) complete; Phase 3A Part A (post-verification input-integrity check) complete; Phase 2C correctness patch (cleanup contract, input-protection honesty, archive-attribute fix) complete; Phase 2C.1 (containerized-verification acceptance patch) complete; Phase 2C (containerized verification) complete; Phase 2B.2 (durable-command gap closure, handoff milestone finished) complete; Phase 2B.1 (handoff correctness patch) complete; Phase 2B (committed-checkpoint two-worker handoff) complete; Phase 2A.2 (workspace-classification + checkpoint-validation correctness patch) complete; Phase 2A.1 (committed-state reconciliation correctness patch) complete; Phase 2A (one real Git execution worker) complete; Phase 1.2.1 (OpenTelemetry + Prometheus/Grafana monitoring + reliability patch) complete
 
-**Demo UI, this session**: turns the AI repair pipeline into a clickable
-local demo -- `src/api/` (plain `node:http`, `demo_runs` table via
-`infra/migrations/0013_demo_runs.sql`, one active run at a time,
-reconciled to `interrupted` on every restart) and `ui/` (static React,
-CDN script tags, no build step). Full setup, modes, API shape, and
-current limitations: see README.md "Demo UI" -- not repeated here.
-Verified both by curl (invalid input, untrusted origin, overlapping
-starts, live-mode opt-in enforcement, cancellation) and by actually
-driving the UI in the built-in browser tool: start -> poll through
-Generation/Verification/Checkpoint/Transfer/Restore-Ack -> a completed
-run showing worker A/B commit identity MATCHES and a confirmed
-acknowledgement, plus a Cancel-button run correctly reported as
-`verification_cancelled` (not the generic `deadline_exceeded` it was
-conflated with before a corrective fix to run-task-ai.ts this session).
-Tests: `tests/integration/api.test.ts`, 7/7 passing on Node 24.
+**Demo UI release-readiness pass, this session**: a review of the Demo
+UI (below) found concrete, real defects, all fixed. Full setup, API
+shape, and current limitations: see README.md "Demo UI" -- not
+repeated here. Summary of what was actually wrong and fixed:
+
+- `executor.ts`'s `active` reservation was held BEFORE the durable
+  `insertRun` write, so a failed write left the demo permanently
+  unable to start a new run -- fixed (reservation only held after
+  success); errors are now sanitized into fixed, actionable codes, not
+  a truncated arbitrary message.
+- Cancellation never reached deterministic (`run-task.ts`) or worker
+  B's restore (`handoff.ts`) Docker verification, only the AI path's --
+  both now accept and propagate a real `signal`. Along the way, found
+  and fixed a REAL bug in `docker-verify.ts` itself: an already-aborted
+  signal was silently ignored (the DOM "abort" event never re-fires for
+  a listener added after `.abort()` already ran) -- a pre-cancelled run
+  would previously complete verification anyway.
+- Startup reconciliation now only runs AFTER a DB-backed singleton lock
+  is acquired (`src/api/singleton-lock.ts`, reusing the existing
+  `publisher_leader` epoch-lock mechanism under its own `lock_name`) --
+  a second instance against the same database refuses to start, so it
+  can never touch a genuinely active first instance's runs. Bounded
+  graceful shutdown added (stop accepting work, cancel+await the active
+  run, release resources).
+- Stage reporting is now derived from actual execution facts (did any
+  attempt really reach verification?), never assumed/stale.
+- `ui/` rebuilt as TypeScript + React, bundled locally with esbuild
+  (`npm run build:ui`) -- no CDN, no runtime network dependency; frontend
+  typechecking is now part of `npm run typecheck`.
+
+Verified via `tests/integration/api.test.ts` (10/10) and
+`tests/integration/cancellation-barriers.test.ts` (2/2, deterministic
+barriers, one documented structural limitation -- see that file), plus
+driving the rebuilt bundle in the built-in browser tool end to end
+(screenshots: `docs/screenshots/`). All on Node 24.
 
 **AI repair milestone, this session**: one real AI-generated repair
 through the EXISTING reliability pipeline (branched from PR #9's
