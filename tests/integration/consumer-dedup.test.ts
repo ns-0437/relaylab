@@ -2,7 +2,7 @@ import { test, before, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
 import type mysql from "mysql2/promise";
 import type { RowDataPacket } from "mysql2/promise";
-import { processBatch, applyEventWithDedup, defaultConsumerOptions } from "../../src/messaging/consumer.js";
+import { processBatch, applyEventWithDedup, handleMessage, defaultConsumerOptions, type ProcessOutcome } from "../../src/messaging/consumer.js";
 import { runPublisherOnce } from "../../src/messaging/publisher.js";
 import { makeTaskStoreLive } from "../../src/db/task-store.js";
 import { decodeEventEnvelope } from "../../src/protocol/protocol.js";
@@ -224,3 +224,80 @@ test("a malformed event is dead-lettered instead of blocking the stream forever"
   assert.equal(outcome.deadLettered, 1);
   assert.equal(outcome.processed, 0);
 });
+
+test(
+  "a transient MySQL deadlock during applyEventWithDedup is not acked as successful, and is recovered " +
+    "entirely through the REAL delivery path (handleMessage + broker redelivery) once the fault clears -- " +
+    "no test-only retry wrapper involved. Controlled, deterministic fault injection: the pool's own " +
+    "getConnection is wrapped to make exactly ONE INSERT INTO consumer_processed throw a real " +
+    "ER_LOCK_DEADLOCK-shaped error, simulating a genuine transient InnoDB deadlock without needing an " +
+    "actual concurrent race.",
+  async () => {
+    const taskId = uniqueId("task");
+    await publishOneCheckpointEvent(taskId);
+
+    const msg1 = (async () => {
+      const fetch = nats.js.fetch(eventsStream(), eventsDurable(), { batch: 1, expires: 2000 });
+      for await (const m of fetch) return m;
+      throw new Error("expected one message");
+    })();
+    const realGetConnection = pool.getConnection.bind(pool);
+    let armed = true;
+    pool.getConnection = (async (...args: Parameters<typeof pool.getConnection>) => {
+      const conn = await realGetConnection(...args);
+      if (!armed) return conn;
+      const realQuery = conn.query.bind(conn);
+      conn.query = ((...qargs: Parameters<typeof conn.query>) => {
+        const sql = String(qargs[0]);
+        if (armed && sql.includes("INSERT INTO consumer_processed")) {
+          armed = false;
+          const err = new Error("Deadlock found when trying to get lock; try restarting transaction");
+          (err as NodeJS.ErrnoException).code = "ER_LOCK_DEADLOCK";
+          return Promise.reject(err);
+        }
+        return realQuery(...qargs);
+      }) as typeof conn.query;
+      return conn;
+    }) as typeof pool.getConnection;
+
+    const msg = await msg1;
+    const outcome1: ProcessOutcome = { processed: 0, deduped: 0, deadLettered: 0, buffered: 0, conflicts: 0 };
+    try {
+      await assert.rejects(
+        () => handleMessage(pool, msg, defaultConsumerOptions(), outcome1),
+        (err: NodeJS.ErrnoException) => err.code === "ER_LOCK_DEADLOCK",
+        "the simulated deadlock must propagate out of handleMessage, not be swallowed",
+      );
+    } finally {
+      pool.getConnection = realGetConnection;
+    }
+    assert.equal(outcome1.processed, 0, "the failed attempt must not be counted as a successful application");
+    assert.equal(await consumerState(taskId), null, "the deadlocked transaction must have rolled back completely -- no partial state");
+
+    // No ack on the throw path (consumer.ts's outer catch rethrows without
+    // calling msg.ack()) means the broker still holds this delivery
+    // un-acked. Force the redelivery deterministically with nak() rather
+    // than waiting out real ack_wait, matching the established pattern in
+    // quarantine.test.ts's own fault-injection recovery test.
+    msg.nak(10);
+    const redelivered = (async () => {
+      const fetch = nats.js.fetch(eventsStream(), eventsDurable(), { batch: 1, expires: 2000 });
+      for await (const m of fetch) return m;
+      throw new Error("expected the redelivered message");
+    })();
+    const msg2 = await redelivered;
+    assert.ok(msg2.info.redeliveryCount >= 2, "this must be a genuine broker redelivery of the same message");
+
+    const outcome2: ProcessOutcome = { processed: 0, deduped: 0, deadLettered: 0, buffered: 0, conflicts: 0 };
+    await handleMessage(pool, msg2, defaultConsumerOptions(), outcome2);
+    assert.equal(outcome2.processed, 1, "with the fault cleared, the retried real delivery attempt must now succeed and ack");
+
+    const state = await consumerState(taskId);
+    assert.equal(state?.eventCount, 1, "exactly one durable application overall, despite the earlier failed attempt");
+    const [processedRows] = await pool.query<RowDataPacket[]>(
+      `SELECT COUNT(*) AS c FROM consumer_processed WHERE consumer_name = ?`,
+      [defaultConsumerOptions().consumerName],
+    );
+    assert.equal(processedRows[0]!.c, 1, "exactly one durable consumer_processed row -- no duplicate effect from the earlier rolled-back attempt");
+  },
+);
