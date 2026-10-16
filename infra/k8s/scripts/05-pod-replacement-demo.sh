@@ -19,8 +19,8 @@ require_cluster_exists
 # shellcheck disable=SC1090
 source "$SECRETS_FILE"
 
-if [ ! -f "$PORT_FORWARD_PID_FILE" ]; then
-  fail "no port-forwards running -- run start-port-forwards.sh first."
+if [ ! -f "$MYSQL_PF_RECORD" ]; then
+  fail "no port-forwards tracked ($MYSQL_PF_RECORD not found) -- run start-port-forwards.sh first."
 fi
 
 MYSQL_ENV=(RELAYLAB_MYSQL_HOST=127.0.0.1 "RELAYLAB_MYSQL_PORT=$K8S_MYSQL_HOST_PORT" RELAYLAB_MYSQL_DATABASE=relaylab
@@ -32,9 +32,12 @@ log "current consumer pod: $OLD_POD (uid=$OLD_UID)"
 
 log "=== illustrative step: a port-forward targeting this POD BY NAME (not the Service) ==="
 log "starting pod-direct port-forward localhost:19470 -> pod/$OLD_POD:9470 ..."
-kctl port-forward --address 127.0.0.1 "pod/$OLD_POD" 19470:9470 >/tmp/relaylab-pf-pod-direct.log 2>&1 &
-POD_PF_PID=$!
-sleep 2
+POD_PF_RECORD="$K8S_DIR/.pf-pod-direct.record"
+POD_MARKER="pod/$OLD_POD 19470:9470"
+po_start "$POD_PF_RECORD" /tmp/relaylab-pf-pod-direct.log /tmp/relaylab-pf-pod-direct.err.log \
+  kubectl "$(kctl_args port-forward --address 127.0.0.1 "pod/$OLD_POD" 19470:9470)" \
+  "$POD_MARKER"
+sleep 1.5  # the tunnel itself needs a moment to become ready for HTTP traffic, beyond po_start's own process-identity settle time
 if curl -sf "http://127.0.0.1:19470/healthz/ready" >/dev/null 2>&1; then
   log "pod-direct port-forward confirmed working against $OLD_POD"
 else
@@ -61,8 +64,12 @@ else
   log "This is a dead HOST FORWARDING PROCESS, not an application failure -- the application's own recovery is verified"
   log "below via the Service-based port-forward (svc/relaylab-mysql-lb), which was never affected by this pod's deletion."
 fi
-kill_pid_robust "$POD_PF_PID"
-log "stopped the pod-direct port-forward process (it would otherwise sit dead forever, pointed at a pod that no longer exists)"
+# po_stop handles BOTH possible states cleanly: if kubectl has already
+# exited on its own (common, once it notices the connection is gone),
+# this is a safe no-op; if it is still running, identity still matches
+# (creation time/exe/cmdline are unchanged -- only the TUNNEL is dead,
+# not the process's own identity), so it is terminated normally.
+po_stop "$POD_PF_RECORD" || log "WARNING: could not confirm the pod-direct port-forward was stopped -- see $PO_RECOVERY_LOG (this does not affect the rest of this demo, which uses the separate Service-based port-forwards)."
 
 log "=== waiting for the Deployment to produce a NEW, Ready consumer pod with a DIFFERENT uid ==="
 NEW_POD=""

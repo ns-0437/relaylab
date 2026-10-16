@@ -23,22 +23,26 @@ wait_ready_or_diagnose "app=relaylab-nats" "$READY_TIMEOUT"
 
 log "running the migration step against the cluster MySQL via a temporary port-forward ..."
 MIGRATE_LOCAL_PORT=33061
+MIGRATE_PF_RECORD="$K8S_DIR/.pf-migrate.record"
 require_port_free "$MIGRATE_LOCAL_PORT" "relaylab migration port-forward"
 # --address 127.0.0.1 explicit -- see start-port-forwards.sh's header
 # comment for why the default (localhost, tries 127.0.0.1 AND ::1) can
 # silently succeed on the wrong address family when 127.0.0.1 is taken.
-kctl port-forward --address 127.0.0.1 svc/relaylab-mysql-lb "${MIGRATE_LOCAL_PORT}:3306" >/tmp/relaylab-migrate-port-forward.log 2>&1 &
-MIGRATE_PF_PID=$!
+# po_start (process-ownership.sh) captures real process identity and
+# fails loudly (rather than hanging or leaving an orphan) if the
+# port-forward does not start cleanly -- see docs/KUBERNETES.md "Safe
+# process termination."
+MIGRATE_MARKER="svc/relaylab-mysql-lb ${MIGRATE_LOCAL_PORT}:3306"
+po_start "$MIGRATE_PF_RECORD" /tmp/relaylab-migrate-port-forward.log /tmp/relaylab-migrate-port-forward.err.log \
+  kubectl "$(kctl_args port-forward --address 127.0.0.1 svc/relaylab-mysql-lb "${MIGRATE_LOCAL_PORT}:3306")" \
+  "$MIGRATE_MARKER"
 # Covers EVERY exit path from here on, including a `fail` call (which is
-# just `exit 1`) raised by the bind-failure check or the readiness loop
-# below -- the temporary migration forward is never left running on
-# failure, not just on the success path.
-trap 'kill_pid_robust "$MIGRATE_PF_PID"' EXIT
-sleep 0.3
-if ! kill -0 "$MIGRATE_PF_PID" 2>/dev/null; then
-  cat /tmp/relaylab-migrate-port-forward.log >&2 || true
-  fail "the temporary migration port-forward failed to start -- see log above."
-fi
+# just `exit 1`) raised by the readiness loop below -- the temporary
+# migration forward is never left running on failure, not just on the
+# success path. po_stop verifies identity before terminating; `|| true`
+# here because by the time this trap fires the port-forward may already
+# have been stopped on the success path below.
+trap 'po_stop "$MIGRATE_PF_RECORD" || true' EXIT
 
 # Bounded wait for the forwarded port to actually accept connections
 # before handing it to the migration CLI (a cold port-forward can take a
@@ -46,7 +50,7 @@ fi
 for i in $(seq 1 30); do
   if (exec 3<>"/dev/tcp/127.0.0.1/${MIGRATE_LOCAL_PORT}") 2>/dev/null; then exec 3>&-; break; fi
   sleep 0.5
-  if [ "$i" -eq 30 ]; then kill_pid_robust "$MIGRATE_PF_PID"; fail "port-forward to relaylab-mysql-lb never became reachable on 127.0.0.1:${MIGRATE_LOCAL_PORT}"; fi
+  if [ "$i" -eq 30 ]; then fail "port-forward to relaylab-mysql-lb never became reachable on 127.0.0.1:${MIGRATE_LOCAL_PORT}"; fi
 done
 
 assert_targeting_cluster_mysql 127.0.0.1 "$MIGRATE_LOCAL_PORT" "$MYSQL_APP_USER" "$MYSQL_APP_PASSWORD" relaylab
@@ -54,11 +58,10 @@ assert_targeting_cluster_mysql 127.0.0.1 "$MIGRATE_LOCAL_PORT" "$MYSQL_APP_USER"
 if ! (cd "$REPO_ROOT" && RELAYLAB_MYSQL_HOST=127.0.0.1 RELAYLAB_MYSQL_PORT="$MIGRATE_LOCAL_PORT" RELAYLAB_MYSQL_DATABASE=relaylab \
      RELAYLAB_MYSQL_USER="$MYSQL_APP_USER" RELAYLAB_MYSQL_PASSWORD="$MYSQL_APP_PASSWORD" \
      npx tsx src/db/migrate-cli.ts); then
-  kill_pid_robust "$MIGRATE_PF_PID"
   fail "migration failed -- refusing to apply/wait for the publisher/consumer Deployments. The cluster is NOT ready."
 fi
 
-kill_pid_robust "$MIGRATE_PF_PID"
+po_stop "$MIGRATE_PF_RECORD"
 trap - EXIT
 log "migration succeeded"
 

@@ -11,6 +11,17 @@ source lib/common.sh
 
 if kind get clusters 2>/dev/null | grep -qx "$CLUSTER_NAME"; then
   log "kind cluster '$CLUSTER_NAME' already exists -- reusing it, not recreating."
+  # Phase 3A.2: a real gap, found running this from a SECOND checkout of
+  # this repo against a cluster an EARLIER checkout had already created
+  # -- the "reuse" branch used to do nothing further, so THIS checkout's
+  # own $KUBECONFIG_FILE was simply never written and every subsequent
+  # kctl call failed outright. `kind export kubeconfig` derives a fresh
+  # kubeconfig from the cluster's OWN stored certs -- it is not copying
+  # any other checkout's file, generated credentials, or state.
+  if [ ! -f "$KUBECONFIG_FILE" ]; then
+    log "this checkout has no local kubeconfig yet for the existing cluster -- exporting one ..."
+    kind export kubeconfig --name "$CLUSTER_NAME" --kubeconfig "$KUBECONFIG_FILE"
+  fi
 else
   log "creating kind cluster '$CLUSTER_NAME' (pinned node image, see kind-config.yaml) ..."
   kind create cluster --name "$CLUSTER_NAME" --config "$K8S_DIR/kind-config.yaml" --kubeconfig "$KUBECONFIG_FILE"

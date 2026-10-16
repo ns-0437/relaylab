@@ -1,30 +1,20 @@
 #!/usr/bin/env bash
-# Phase 3A Part B: kills EXACTLY the PIDs this project's own
-# start-port-forwards.sh recorded -- never a blind `pkill kubectl`, which
-# could kill an unrelated port-forward the user has running for something
-# else entirely.
+# Phase 3A Part B/3A.2: stops EXACTLY the processes this project's own
+# start-port-forwards.sh started AND whose identity still matches what
+# was recorded -- never a blind `pkill kubectl`, and never a port-based
+# sweep (see docs/KUBERNETES.md "Safe process termination" for why the
+# old kill_port_robust/kill_pid_robust mechanism was replaced). If
+# identity cannot be confirmed for either record, that one is reported
+# as a failure and LEFT RUNNING -- po_stop never guesses.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 source lib/common.sh
 
-if [ ! -f "$PORT_FORWARD_PID_FILE" ]; then
-  log "no $PORT_FORWARD_PID_FILE found -- nothing to stop."
-  exit 0
-fi
+status=0
+po_stop "$MYSQL_PF_RECORD" || status=1
+po_stop "$NATS_PF_RECORD" || status=1
 
-read -r -a PIDS < "$PORT_FORWARD_PID_FILE"
-for pid in "${PIDS[@]}"; do
-  # kill_pid_robust (lib/common.sh): plain `kill` alone has repeatedly
-  # left the underlying kubectl.exe process running as an orphan on this
-  # host -- always also tries taskkill, unconditionally.
-  kill_pid_robust "$pid"
-  log "stopped port-forward process $pid (by pid)"
-done
-# Phase 3A.1: ALSO kill by the known project ports directly -- see
-# kill_port_robust's own comment for why PID-based killing alone was
-# observed to miss in practice. Project-owned ports only, never a blind
-# process sweep.
-kill_port_robust "$K8S_MYSQL_HOST_PORT"
-kill_port_robust "$K8S_NATS_HOST_PORT"
-log "also force-cleared ports ${K8S_MYSQL_HOST_PORT}/${K8S_NATS_HOST_PORT} directly, in case the tracked PIDs did not match the actual listening process"
-rm -f "$PORT_FORWARD_PID_FILE"
+if [ "$status" -ne 0 ]; then
+  log "one or more port-forwards could not be safely stopped -- see the messages above and $PO_RECOVERY_LOG."
+fi
+exit "$status"

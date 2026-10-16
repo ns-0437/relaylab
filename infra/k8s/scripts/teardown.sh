@@ -15,9 +15,9 @@ if [ "$CONFIRM" != "yes" ]; then
   exit 1
 fi
 
-if [ -f "$PORT_FORWARD_PID_FILE" ]; then
+if [ -f "$MYSQL_PF_RECORD" ] || [ -f "$NATS_PF_RECORD" ]; then
   log "stopping project-owned port-forwards first ..."
-  "$K8S_DIR/scripts/stop-port-forwards.sh"
+  "$K8S_DIR/scripts/stop-port-forwards.sh" || log "WARNING: not every port-forward could be confirmed stopped -- proceeding with teardown anyway (the kind cluster delete below removes the pods they were forwarding to regardless)."
 fi
 
 if kind get clusters 2>/dev/null | grep -qx "$CLUSTER_NAME"; then
