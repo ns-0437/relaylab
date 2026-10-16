@@ -102,6 +102,20 @@ function stepSignal(callerSignal: AbortSignal | undefined, deadlineAt: number): 
   return AbortSignal.any(signals);
 }
 
+/**
+ * A caller-requested cancellation and this function's OWN overall
+ * deadline elapsing are distinct causes -- conflating them into one
+ * outcome would mislabel an explicit user cancel (e.g. the demo API's
+ * "cancel run" button) as a generic "deadline_exceeded" timeout, which
+ * is misleading to anything reporting on it. Returns `null` when
+ * neither condition holds.
+ */
+function checkCancelledOrDeadline(callerSignal: AbortSignal | undefined, deadlineAt: number): { kind: "cancelled" } | { kind: "deadline" } | null {
+  if (callerSignal?.aborted) return { kind: "cancelled" };
+  if (Date.now() >= deadlineAt) return { kind: "deadline" };
+  return null;
+}
+
 type WorkspaceReuseState =
   | { kind: "ready" }
   | { kind: "edit_pending_commit" }
@@ -243,9 +257,10 @@ export async function runAiRepairTask(args: RunAiRepairTaskArgs): Promise<AiRunO
             await resetHard(worktreeDir, baseCommit, env);
           }
 
-          if (args.signal?.aborted || Date.now() >= deadlineAt) {
-            span.setAttribute("relaylab.outcome", "deadline_exceeded");
-            return { outcome: { kind: "deadline_exceeded" }, attempts };
+          const boundary1 = checkCancelledOrDeadline(args.signal, deadlineAt);
+          if (boundary1) {
+            span.setAttribute("relaylab.outcome", boundary1.kind === "cancelled" ? "ai_repair_cancelled" : "deadline_exceeded");
+            return { outcome: boundary1.kind === "cancelled" ? { kind: "verification_cancelled", verification: cancelledVerificationPlaceholder() } : { kind: "deadline_exceeded" }, attempts };
           }
 
           const genSignal = stepSignal(args.signal, deadlineAt);
@@ -275,9 +290,10 @@ export async function runAiRepairTask(args: RunAiRepairTaskArgs): Promise<AiRunO
           );
         }
 
-        if (args.signal?.aborted || Date.now() >= deadlineAt) {
-          span.setAttribute("relaylab.outcome", "deadline_exceeded");
-          return { outcome: { kind: "deadline_exceeded" }, attempts };
+        const boundary2 = checkCancelledOrDeadline(args.signal, deadlineAt);
+        if (boundary2) {
+          span.setAttribute("relaylab.outcome", boundary2.kind === "cancelled" ? "ai_repair_cancelled" : "deadline_exceeded");
+          return { outcome: boundary2.kind === "cancelled" ? { kind: "verification_cancelled", verification: cancelledVerificationPlaceholder() } : { kind: "deadline_exceeded" }, attempts };
         }
 
         const pinnedTree = await currentTree(worktreeDir, env);
@@ -331,9 +347,10 @@ export async function runAiRepairTask(args: RunAiRepairTaskArgs): Promise<AiRunO
         // Check cancellation AND ownership one final time before ever
         // publishing -- a signal fired, or a takeover that happened,
         // during Docker verification must still prevent a checkpoint.
-        if (args.signal?.aborted || Date.now() >= deadlineAt) {
-          span.setAttribute("relaylab.outcome", "deadline_exceeded");
-          return { outcome: { kind: "deadline_exceeded" }, attempts };
+        const boundary3 = checkCancelledOrDeadline(args.signal, deadlineAt);
+        if (boundary3) {
+          span.setAttribute("relaylab.outcome", boundary3.kind === "cancelled" ? "ai_repair_cancelled" : "deadline_exceeded");
+          return { outcome: boundary3.kind === "cancelled" ? { kind: "verification_cancelled", verification: cancelledVerificationPlaceholder() } : { kind: "deadline_exceeded" }, attempts };
         }
         const finalRenewal = await renewLeaseOrStop(args.pool, args.taskId, args.ownerId, args.epoch, LEASE_RENEWAL_MS);
         if (!finalRenewal.ok) {
