@@ -15,10 +15,23 @@
 // silently swallowed into a fake "success."
 import Anthropic from "@anthropic-ai/sdk";
 
-/** Model string is configurable, never hardcoded to one value callers can't override. */
+/**
+ * Model string is configurable, never hardcoded to one value callers
+ * can't override. This default is a model ID verified against the
+ * Anthropic model catalog current at the time this milestone was
+ * written (not guessed/invented) -- `loadAnthropicAdapterConfig` still
+ * requires `RELAYLAB_AI_MODEL` to be set EXPLICITLY unless the caller
+ * opts into trusting this verified default (see
+ * `RELAYLAB_AI_ALLOW_DEFAULT_MODEL` below), so a silent, unreviewed
+ * drift onto a renamed/retired model ID is never possible.
+ */
 export const DEFAULT_AI_REPAIR_MODEL = "claude-opus-5-5";
 export const DEFAULT_AI_REPAIR_MAX_OUTPUT_TOKENS = 2048;
 export const DEFAULT_AI_REPAIR_TIMEOUT_MS = 60_000;
+/** Hard ceilings -- not merely "positive", a documented upper bound so a misconfigured env var cannot request an unbounded-cost or unbounded-duration call. */
+export const MAX_ALLOWED_OUTPUT_TOKENS = 8_192;
+export const MAX_ALLOWED_REQUEST_TIMEOUT_MS = 180_000;
+export const MIN_ALLOWED_REQUEST_TIMEOUT_MS = 1_000;
 
 export interface AnthropicAdapterConfig {
   model: string;
@@ -26,25 +39,56 @@ export interface AnthropicAdapterConfig {
   requestTimeoutMs: number;
 }
 
+function parseBoundedInt(raw: string | undefined, name: string, fallback: number, min: number, max: number): number {
+  if (raw === undefined) return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n)) {
+    throw new Error(`${name} must be an integer, got "${raw}"`);
+  }
+  if (n < min || n > max) {
+    throw new Error(`${name} must be between ${min} and ${max} inclusive, got ${n}`);
+  }
+  return n;
+}
+
 /**
- * Reads ONLY the three tuning knobs this adapter exposes from the
+ * Reads ONLY the tuning knobs this adapter exposes from the
  * environment -- never the API key itself (the SDK client construction
  * below does that). Safe to call with no credentials present at all:
  * this never throws for a missing key, so importing/configuring the
  * adapter (and anything that imports it, including this project's own
  * test files) never requires one. A key is only ever needed at the
  * point of an actual `messages.create` call.
+ *
+ * `model` requires an EXPLICIT `RELAYLAB_AI_MODEL` unless
+ * `RELAYLAB_AI_ALLOW_DEFAULT_MODEL=1` is also set -- this is the
+ * "require an explicit model setting unless the default is verified"
+ * boundary: the fallback value above IS a verified real model ID, but
+ * this function still refuses to silently use it in an unattended
+ * config unless the caller affirmatively opts in, so a future model
+ * rename/retirement is caught at config time, not discovered from a
+ * confusing provider error at call time.
  */
 export function loadAnthropicAdapterConfig(): AnthropicAdapterConfig {
-  const model = process.env.RELAYLAB_AI_MODEL?.trim() || DEFAULT_AI_REPAIR_MODEL;
-  const maxOutputTokens = Number(process.env.RELAYLAB_AI_MAX_OUTPUT_TOKENS ?? DEFAULT_AI_REPAIR_MAX_OUTPUT_TOKENS);
-  const requestTimeoutMs = Number(process.env.RELAYLAB_AI_TIMEOUT_MS ?? DEFAULT_AI_REPAIR_TIMEOUT_MS);
-  if (!Number.isFinite(maxOutputTokens) || maxOutputTokens <= 0) {
-    throw new Error(`RELAYLAB_AI_MAX_OUTPUT_TOKENS must be a positive number, got ${process.env.RELAYLAB_AI_MAX_OUTPUT_TOKENS}`);
+  const rawModel = process.env.RELAYLAB_AI_MODEL?.trim();
+  let model: string;
+  if (rawModel) {
+    model = rawModel;
+  } else if (process.env.RELAYLAB_AI_ALLOW_DEFAULT_MODEL === "1") {
+    model = DEFAULT_AI_REPAIR_MODEL;
+  } else {
+    throw new Error(
+      `RELAYLAB_AI_MODEL must be set explicitly (or set RELAYLAB_AI_ALLOW_DEFAULT_MODEL=1 to use the verified default "${DEFAULT_AI_REPAIR_MODEL}")`,
+    );
   }
-  if (!Number.isFinite(requestTimeoutMs) || requestTimeoutMs <= 0) {
-    throw new Error(`RELAYLAB_AI_TIMEOUT_MS must be a positive number, got ${process.env.RELAYLAB_AI_TIMEOUT_MS}`);
-  }
+  const maxOutputTokens = parseBoundedInt(process.env.RELAYLAB_AI_MAX_OUTPUT_TOKENS, "RELAYLAB_AI_MAX_OUTPUT_TOKENS", DEFAULT_AI_REPAIR_MAX_OUTPUT_TOKENS, 1, MAX_ALLOWED_OUTPUT_TOKENS);
+  const requestTimeoutMs = parseBoundedInt(
+    process.env.RELAYLAB_AI_TIMEOUT_MS,
+    "RELAYLAB_AI_TIMEOUT_MS",
+    DEFAULT_AI_REPAIR_TIMEOUT_MS,
+    MIN_ALLOWED_REQUEST_TIMEOUT_MS,
+    MAX_ALLOWED_REQUEST_TIMEOUT_MS,
+  );
   return { model, maxOutputTokens, requestTimeoutMs };
 }
 
@@ -85,12 +129,15 @@ export class AnthropicAdapterError extends Error {
  * external `AbortSignal` so a caller can cancel a still-in-flight
  * request (e.g. the whole repair attempt being cancelled).
  *
- * Never retries internally beyond the SDK's own default transient-error
- * retries -- the bounded-attempts policy (at most two REPAIR attempts,
- * each a fresh prompt) lives in ai-repair.ts, not here. Any provider
- * failure (auth, rate limit, timeout, 5xx) is wrapped in
- * `AnthropicAdapterError` and thrown -- never swallowed, never
- * downgraded into a fabricated response.
+ * Issues at most ONE real HTTP request -- `maxRetries: 0` explicitly
+ * disables the SDK's own default transient-error retries, so the
+ * bounded-attempts policy run-task-ai.ts enforces (at most two REPAIR
+ * attempts) also bounds the actual number of HTTP calls made, not just
+ * the number of logical attempts. Any provider failure (auth, rate
+ * limit, timeout, 5xx) is wrapped in a sanitized `AnthropicAdapterError`
+ * and thrown -- never swallowed, never downgraded into a fabricated
+ * response, and never carrying the raw SDK error body (which can echo
+ * request content) into a message a caller might log.
  */
 export async function requestStructuredEdit(
   client: MessagesClient,
@@ -106,13 +153,24 @@ export async function requestStructuredEdit(
         max_tokens: config.maxOutputTokens,
         messages: [{ role: "user", content: prompt }],
       },
-      { timeout: config.requestTimeoutMs, signal },
+      // maxRetries: 0 is REQUIRED, not cosmetic -- the SDK's own default
+      // (2 retries on 408/409/429/5xx/connection errors) would silently
+      // make ONE logical "attempt" issue up to 3 real HTTP requests,
+      // defeating the bounded-attempts policy (at most 2 end-to-end
+      // repair attempts) that run-task-ai.ts enforces at the attempt
+      // level. Disabling SDK-level retries here is what makes "2
+      // attempts" also bound the actual number of HTTP calls made.
+      { timeout: config.requestTimeoutMs, signal, maxRetries: 0 },
     );
   } catch (err) {
-    throw new AnthropicAdapterError(
-      `Anthropic API call failed (model=${config.model}): ${err instanceof Error ? err.message : String(err)}`,
-      err,
-    );
+    // Sanitized deliberately: never include the raw SDK error's full
+    // message/body (which can echo back request content, including
+    // this prompt, in some validation-error responses) -- only a fixed
+    // classification (error constructor name + HTTP status, when
+    // present) ever reaches a log or an attempt record.
+    const status = err instanceof Anthropic.APIError ? err.status : undefined;
+    const kind = err instanceof Error ? err.constructor.name : "UnknownError";
+    throw new AnthropicAdapterError(`Anthropic API call failed (model=${config.model}): ${kind}${status ? ` (status ${status})` : ""}`, err);
   }
 
   const textBlock = response.content.find((block): block is Anthropic.TextBlock => block.type === "text");
