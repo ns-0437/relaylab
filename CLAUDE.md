@@ -11,7 +11,23 @@ around cross-device coding agents. Not affiliated with Capy, does not
 reproduce proprietary internals, and does not claim to fix any specific
 unresolved Capy bug.
 
-## Current phase: AI repair milestone (one real AI-generated repair through the existing verification/checkpoint/handoff pipeline, bounded to 2 attempts, never bypassing identity/verification checks) complete; Phase 3A.2 corrective patch (fixed a destructive fresh-schema drop-before-create, a TOCTOU gap at the process-termination boundary, and an inaccurately-labeled lease test) complete; Phase 3A.2 (process-ownership safety, precise consumer lease guarantee, fresh-schema reproducibility) complete; Phase 3A.1 (Kubernetes reliability patch -- re-entry safety, consumer exclusivity, dependency-aware readiness, port-forward hardening) complete; Phase 3A Part B (local Kubernetes deployment of the publisher/consumer against cluster MySQL/NATS) complete; Phase 3A Part A (post-verification input-integrity check) complete; Phase 2C correctness patch (cleanup contract, input-protection honesty, archive-attribute fix) complete; Phase 2C.1 (containerized-verification acceptance patch) complete; Phase 2C (containerized verification) complete; Phase 2B.2 (durable-command gap closure, handoff milestone finished) complete; Phase 2B.1 (handoff correctness patch) complete; Phase 2B (committed-checkpoint two-worker handoff) complete; Phase 2A.2 (workspace-classification + checkpoint-validation correctness patch) complete; Phase 2A.1 (committed-state reconciliation correctness patch) complete; Phase 2A (one real Git execution worker) complete; Phase 1.2.1 (OpenTelemetry + Prometheus/Grafana monitoring + reliability patch) complete
+## Current phase: Demo UI (local HTTP API + static React UI over the AI repair pipeline, one run at a time, simulated by default) complete; AI repair milestone (one real AI-generated repair through the existing verification/checkpoint/handoff pipeline, bounded to 2 attempts, never bypassing identity/verification checks) complete; Phase 3A.2 corrective patch (fixed a destructive fresh-schema drop-before-create, a TOCTOU gap at the process-termination boundary, and an inaccurately-labeled lease test) complete; Phase 3A.2 (process-ownership safety, precise consumer lease guarantee, fresh-schema reproducibility) complete; Phase 3A.1 (Kubernetes reliability patch -- re-entry safety, consumer exclusivity, dependency-aware readiness, port-forward hardening) complete; Phase 3A Part B (local Kubernetes deployment of the publisher/consumer against cluster MySQL/NATS) complete; Phase 3A Part A (post-verification input-integrity check) complete; Phase 2C correctness patch (cleanup contract, input-protection honesty, archive-attribute fix) complete; Phase 2C.1 (containerized-verification acceptance patch) complete; Phase 2C (containerized verification) complete; Phase 2B.2 (durable-command gap closure, handoff milestone finished) complete; Phase 2B.1 (handoff correctness patch) complete; Phase 2B (committed-checkpoint two-worker handoff) complete; Phase 2A.2 (workspace-classification + checkpoint-validation correctness patch) complete; Phase 2A.1 (committed-state reconciliation correctness patch) complete; Phase 2A (one real Git execution worker) complete; Phase 1.2.1 (OpenTelemetry + Prometheus/Grafana monitoring + reliability patch) complete
+
+**Demo UI, this session**: turns the AI repair pipeline into a clickable
+local demo -- `src/api/` (plain `node:http`, `demo_runs` table via
+`infra/migrations/0013_demo_runs.sql`, one active run at a time,
+reconciled to `interrupted` on every restart) and `ui/` (static React,
+CDN script tags, no build step). Full setup, modes, API shape, and
+current limitations: see README.md "Demo UI" -- not repeated here.
+Verified both by curl (invalid input, untrusted origin, overlapping
+starts, live-mode opt-in enforcement, cancellation) and by actually
+driving the UI in the built-in browser tool: start -> poll through
+Generation/Verification/Checkpoint/Transfer/Restore-Ack -> a completed
+run showing worker A/B commit identity MATCHES and a confirmed
+acknowledgement, plus a Cancel-button run correctly reported as
+`verification_cancelled` (not the generic `deadline_exceeded` it was
+conflated with before a corrective fix to run-task-ai.ts this session).
+Tests: `tests/integration/api.test.ts`, 7/7 passing on Node 24.
 
 **AI repair milestone, this session**: one real AI-generated repair
 through the EXISTING reliability pipeline (branched from PR #9's
