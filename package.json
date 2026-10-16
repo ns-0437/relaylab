@@ -28,9 +28,11 @@
     "docker:build-verify-image": "docker build -t relaylab-verify:24.21.0-alpine3.24 infra/verify-image",
     "test:docker-verify": "node --import tsx --test tests/integration/docker-verify.test.ts",
     "demo:k8s-messaging": "tsx tests/integration/demo-k8s-messaging.ts",
-    "demo:fresh-schema": "tsx tests/integration/fresh-schema-verify.ts"
+    "demo:fresh-schema": "tsx tests/integration/fresh-schema-verify.ts",
+    "demo:ai-repair": "tsx tests/integration/demo-ai-repair.ts"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.135.0",
     "@opentelemetry/api": "1.9.1",
     "@opentelemetry/context-async-hooks": "2.12.0",
     "@opentelemetry/core": "2.12.0",
