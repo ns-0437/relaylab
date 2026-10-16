@@ -21,6 +21,7 @@
 import mysql from "mysql2/promise";
 import type { RowDataPacket } from "mysql2/promise";
 import { randomBytes } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { Effect } from "effect";
 import { loadMysqlConfig, loadNatsConfig, eventsStream, eventsDurable } from "../../src/config.js";
 import { applyMigrations } from "../../src/db/migrate.js";
@@ -148,8 +149,24 @@ export interface VerificationOutcome {
  * contains NO database-creation or cleanup of its own -- callers own
  * that lifecycle (see `main` and the test file), so a failure here can
  * never accidentally skip or duplicate a cleanup step.
+ *
+ * `onStreamCreated`, if given, is invoked IMMEDIATELY once the NATS
+ * stream actually exists -- not at the end, via this function's own
+ * return value. The return value alone is not a safe ownership signal:
+ * if ANYTHING after stream creation throws (the representative
+ * task/receipt work, the publish-consume assertions, etc.), this
+ * function never reaches its `return`, and a caller relying solely on
+ * the returned `VerificationOutcome` would never learn a stream was
+ * created at all, leaking it. The callback lets the caller register
+ * ownership the moment it is true, independent of whether this
+ * function ultimately succeeds or throws.
  */
-export async function runVerification(host: string, port: number, dbName: string): Promise<VerificationOutcome> {
+export async function runVerification(
+  host: string,
+  port: number,
+  dbName: string,
+  onStreamCreated?: (info: { natsStreamName: string; natsNamespace: string }) => void,
+): Promise<VerificationOutcome> {
   const base = loadMysqlConfig();
   const freshConfig = { ...base, host, port, user: ROOT_USER, password: ROOT_PASSWORD, database: dbName };
 
@@ -212,6 +229,10 @@ export async function runVerification(host: string, port: number, dbName: string
     const { nc, js, jsm } = await connectNats(loadNatsConfig().servers);
     try {
       await ensureEventsStream(jsm);
+      // The stream now genuinely exists -- register ownership with the
+      // caller RIGHT HERE, before anything below gets a chance to
+      // throw and skip this function's own `return`.
+      onStreamCreated?.({ natsStreamName, natsNamespace });
       await ensureDurableConsumer(jsm);
       await runPublisherOnce(pool, js);
       const fetch = js.fetch(eventsStream(), eventsDurable(), { batch: 1, expires: 3000 });
@@ -271,10 +292,18 @@ async function main() {
   // Collected across the whole run so a cleanup-step failure is NEVER
   // allowed to mask (or be masked by) the original verification result
   // -- both are reported explicitly, see the end of this function.
+  // `natsOwnership` is populated by runVerification's own callback the
+  // INSTANT its stream is created, independent of `outcome` below --
+  // which stays undefined if runVerification throws AFTER creating the
+  // stream but before returning. Relying on `outcome` alone would leak
+  // that stream; this does not.
   let mainError: unknown;
   let outcome: VerificationOutcome | undefined;
+  let natsOwnership: { natsStreamName: string; natsNamespace: string } | undefined;
   try {
-    outcome = await runVerification(base.host, base.port, dbName);
+    outcome = await runVerification(base.host, base.port, dbName, (info) => {
+      natsOwnership = info;
+    });
     log("ALL CHECKS PASSED on the fresh schema.");
   } catch (err) {
     mainError = err;
@@ -282,9 +311,9 @@ async function main() {
 
   const cleanupErrors: string[] = [];
 
-  if (outcome?.natsStreamName && outcome.natsNamespace) {
+  if (natsOwnership) {
     try {
-      await cleanupNatsStream(outcome.natsStreamName, outcome.natsNamespace);
+      await cleanupNatsStream(natsOwnership.natsStreamName, natsOwnership.natsNamespace);
     } catch (err) {
       cleanupErrors.push(`NATS stream cleanup failed: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -316,7 +345,16 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error("[fresh-schema] FAILED (unexpected, outside the normal verification/cleanup flow):", err);
-  process.exitCode = 1;
-});
+// Only run the CLI when this file is the actual entry point (`npm run
+// demo:fresh-schema`, i.e. `tsx tests/integration/fresh-schema-verify.ts`
+// directly) -- NOT when it is merely imported, which
+// fresh-schema-verify.test.ts does for createFreshDatabase/
+// dropDatabaseIfOwned/etc. Without this guard, every test run was ALSO
+// triggering a real, full CLI invocation of main() as a module-load
+// side effect, purely from being imported.
+if (fileURLToPath(import.meta.url) === process.argv[1]) {
+  main().catch((err) => {
+    console.error("[fresh-schema] FAILED (unexpected, outside the normal verification/cleanup flow):", err);
+    process.exitCode = 1;
+  });
+}

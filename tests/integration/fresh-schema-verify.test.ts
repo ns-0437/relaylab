@@ -7,7 +7,8 @@ import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import mysql from "mysql2/promise";
 import { randomBytes } from "node:crypto";
-import { loadMysqlConfig } from "../../src/config.js";
+import { loadMysqlConfig, loadNatsConfig } from "../../src/config.js";
+import { connectNats } from "../../src/messaging/nats-client.js";
 import {
   createFreshDatabase,
   dropDatabaseIfOwned,
@@ -193,6 +194,46 @@ test(
       assert.ok(outcome.natsStreamName, "runVerification must report which NATS stream it created, for cleanup");
       if (outcome.natsStreamName && outcome.natsNamespace) {
         await cleanupNatsStream(outcome.natsStreamName, outcome.natsNamespace);
+      }
+    } finally {
+      await dropDatabaseIfOwned(base.host, base.port, dbName, created);
+    }
+  },
+);
+
+test(
+  "a failure immediately AFTER the NATS stream is created still results in that stream being cleaned up -- " +
+    "ownership is registered via runVerification's onStreamCreated callback the INSTANT the stream exists, " +
+    "not only if runVerification itself returns successfully. Controlled fault injection: the callback " +
+    "itself throws right after recording ownership, simulating a later step (task/receipt work, the " +
+    "publish-consume assertions) failing after stream creation but before the function would otherwise return.",
+  async () => {
+    const { created, dbName } = await createFreshDatabase(base.host, base.port);
+    assert.equal(created, true);
+    let natsOwnership: { natsStreamName: string; natsNamespace: string } | undefined;
+    const simulatedFailure = new Error("simulated failure immediately after stream creation");
+    try {
+      await assert.rejects(
+        () =>
+          runVerification(base.host, base.port, dbName, (info) => {
+            natsOwnership = info;
+            throw simulatedFailure;
+          }),
+        (err: unknown) => err === simulatedFailure,
+        "the simulated post-creation failure must propagate out of runVerification, not be swallowed",
+      );
+      if (!natsOwnership) throw new Error("the onStreamCreated callback never fired -- the stream was never created");
+
+      await cleanupNatsStream(natsOwnership.natsStreamName, natsOwnership.natsNamespace);
+
+      const { nc, jsm } = await connectNats(loadNatsConfig().servers);
+      try {
+        await assert.rejects(
+          () => jsm.streams.info(natsOwnership!.natsStreamName),
+          "the stream must actually be gone after cleanup, not merely attempted",
+        );
+      } finally {
+        await nc.drain();
       }
     } finally {
       await dropDatabaseIfOwned(base.host, base.port, dbName, created);
