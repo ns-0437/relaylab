@@ -85,7 +85,9 @@ export async function updateRunStatus(pool: mysql.Pool, runId: string, status: R
   const [rows] = await pool.query<RowDataPacket[]>(`SELECT detail_json FROM demo_runs WHERE run_id = ?`, [runId]);
   const existing = rows[0] ? (typeof rows[0].detail_json === "string" ? JSON.parse(rows[0].detail_json) : rows[0].detail_json) : {};
   const merged = { ...existing, ...detailPatch };
-  await pool.query(`UPDATE demo_runs SET status = ?, detail_json = ? WHERE run_id = ?`, [status, JSON.stringify(merged), runId]);
+  // A successor's startup reconciliation is terminal for the old process.
+  // Late writes from its cancelled executor must not undo that decision.
+  await pool.query(`UPDATE demo_runs SET status = ?, detail_json = ? WHERE run_id = ? AND status <> 'interrupted'`, [status, JSON.stringify(merged), runId]);
 }
 
 export async function getRun(pool: mysql.Pool, runId: string): Promise<RunRow | null> {
