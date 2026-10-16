@@ -9,7 +9,7 @@
 // -- the model cannot choose a shell command, a file path, or anything
 // else procedural; it can only produce text, which this module then
 // validates strictly before anything is written to disk.
-import { readFile, writeFile } from "node:fs/promises";
+import { lstat, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { TARGET_RELATIVE_PATH } from "./repair.js";
 import {
@@ -33,6 +33,7 @@ export interface RepairEdit {
 
 export type AiRepairAttemptOutcome =
   | { kind: "edit_applied"; changed: boolean }
+  | { kind: "no_change"; reason: string }
   | { kind: "rejected"; reason: string }
   | { kind: "provider_error"; reason: string }
   | { kind: "cancelled" };
@@ -160,6 +161,21 @@ export async function attemptAiRepair(
   signal?: AbortSignal,
 ): Promise<AiRepairAttemptRecord> {
   const targetPath = path.join(worktreeDir, TARGET_RELATIVE_PATH);
+
+  // Reject a symlinked repair target BEFORE reading or writing it --
+  // `lstat` (not `stat`) reports the link itself, never following it,
+  // so a symlink planted at the allowlisted path pointing outside the
+  // worktree is caught here instead of this module unknowingly
+  // reading/writing through it to an arbitrary location.
+  try {
+    const st = await lstat(targetPath);
+    if (!st.isFile()) {
+      return { attempt: attemptNumber, modelUsed: null, outcome: "rejected", reason: `${TARGET_RELATIVE_PATH} is not a regular file (symlink or other special file) -- refusing to read or write through it` };
+    }
+  } catch (err) {
+    return { attempt: attemptNumber, modelUsed: null, outcome: "rejected", reason: `could not stat ${TARGET_RELATIVE_PATH}: ${err instanceof Error ? err.message : String(err)}` };
+  }
+
   let currentContent: string;
   try {
     currentContent = await readFile(targetPath, "utf8");
@@ -194,16 +210,32 @@ export async function attemptAiRepair(
     };
   }
 
-  // Always write, even if the generated content happens to equal the
-  // file's current content -- unlike the deterministic repair's own
-  // idempotency check (repair.ts, aimed at safely resuming a crashed
-  // PRIOR attempt), there is no legitimate reason to skip the write
-  // here: the caller (run-task-ai.ts) resets to a clean base before
-  // every attempt, so "content unchanged" is never evidence of a
-  // completed earlier attempt -- it would otherwise mean an unhelpful
-  // (but syntactically valid) model response silently produces nothing
-  // to commit, which is a confusing failure, not a safe no-op.
+  // A generated edit whose content is BYTE-IDENTICAL to the file's
+  // current content is an explicit, named outcome -- "no_change" --
+  // never silently written (writing identical bytes produces no Git
+  // diff at all, which would otherwise surface downstream as
+  // commitAllowedPaths' confusing "nothing to commit" error) and never
+  // treated as a successful edit. This consumes this attempt (the
+  // caller still advances attemptNumber and may retry) exactly like a
+  // rejected/malformed response does.
   const edit = validated.edits[0]!;
+  if (edit.content === currentContent) {
+    return {
+      attempt: attemptNumber,
+      modelUsed: call.modelUsed,
+      outcome: "no_change",
+      reason: "generated content is identical to the file's current content -- no edit to commit",
+      usage: call.usage,
+    };
+  }
+  // Cancellation is checked again HERE, immediately before the actual
+  // write -- a signal that fired while the provider call above was in
+  // flight (and therefore didn't throw, e.g. the response had already
+  // started arriving) must still stop this attempt from applying
+  // anything to disk.
+  if (signal?.aborted) {
+    return { attempt: attemptNumber, modelUsed: call.modelUsed, outcome: "cancelled" };
+  }
   await writeFile(targetPath, edit.content, "utf8");
   return {
     attempt: attemptNumber,
