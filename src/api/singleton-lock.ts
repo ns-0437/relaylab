@@ -7,7 +7,6 @@
 // this single-process demo, started against the SAME database, cannot
 // reconcile/modify/execute runs the first instance already owns.
 import type mysql from "mysql2/promise";
-import { performance } from "node:perf_hooks";
 import { tryAcquireOrRenewExclusiveLock } from "../messaging/publisher-lock.js";
 
 export const DEMO_API_LOCK_NAME = "demo-api";
@@ -58,7 +57,10 @@ export async function acquireSingletonLock(
   timings: SingletonLockTimings = DEFAULT_TIMINGS,
 ): Promise<SingletonLock | null> {
   const { leaseMs, renewIntervalMs, watchdogIntervalMs } = timings;
-  let startedAt = performance.now();
+  // Anchored BEFORE each call, not after it resolves -- see the
+  // `renewOnce` comment below for why this is the conservative choice.
+  // Recomputed for whichever attempt actually ends up succeeding.
+  let acquiredAt = Date.now();
   let first = await tryAcquireOrRenewExclusiveLock(pool, ownerId, leaseMs, DEMO_API_LOCK_NAME);
   if (!first.acquired) {
     // Self-healing against a MISSING row, not a genuinely held lock:
@@ -72,14 +74,20 @@ export async function acquireSingletonLock(
     // correctly left alone), and only actually helps when the row was
     // truly absent.
     await pool.query(`INSERT IGNORE INTO publisher_leader (lock_name, epoch) VALUES (?, 0)`, [DEMO_API_LOCK_NAME]);
-    startedAt = performance.now();
+    acquiredAt = Date.now();
     first = await tryAcquireOrRenewExclusiveLock(pool, ownerId, leaseMs, DEMO_API_LOCK_NAME);
   }
-  if (!first.acquired || performance.now() >= startedAt + leaseMs) return null;
+  // Same conservative anchoring as every renewal below: if the INITIAL
+  // acquisition's own response was itself delayed long enough that the
+  // lease it reports would already be expired by the time we know
+  // about it, this process never genuinely held a USABLE lease -- treat
+  // it the same as not acquired, rather than returning a lock object
+  // that would just self-declare lost on its very first check.
+  if (!first.acquired || Date.now() >= acquiredAt + leaseMs) return null;
 
   let lost = false;
-  let leaseValidUntil = startedAt + leaseMs;
-  const epoch = first.epoch;
+  let leaseValidUntil = acquiredAt + leaseMs;
+  let currentEpoch = first.epoch;
   let renewing: Promise<void> | null = null;
 
   const declareLost = () => {
@@ -90,27 +98,66 @@ export async function acquireSingletonLock(
     onLost();
   };
 
+  /** Synchronous, checked from several call sites (not only the watchdog's own ticks) -- declares loss immediately if the tracked deadline has already passed, rather than waiting for the next scheduled tick to notice. */
+  const checkExpiryNow = (): void => {
+    if (!lost && Date.now() > leaseValidUntil) declareLost();
+  };
+
   const renewOnce = async (): Promise<void> => {
-    const requestStartedAt = performance.now();
-    const previousDeadline = leaseValidUntil;
-    if (requestStartedAt >= previousDeadline) { declareLost(); return; }
+    // Checked BEFORE issuing the call, not only by the watchdog's own
+    // ticks -- a renewal that is already past its deadline must not
+    // even attempt to extend what the DB may already consider expired.
+    checkExpiryNow();
+    if (lost) return;
+
+    // Anchored to when THIS call starts, not when its response arrives
+    // -- see the acquisition-time comment above. The DB computes the
+    // new lease from ITS OWN clock at execution time, which is always
+    // at or after this call started but strictly before the response
+    // can reach us; using the response-completion time to compute
+    // `leaseValidUntil` would let network/query latency on the return
+    // trip make this process believe the lease lasts LONGER than the
+    // database will actually honor.
+    const callStartedAt = Date.now();
+    let result: { acquired: boolean; epoch: number };
     try {
-      const result = await tryAcquireOrRenewExclusiveLock(pool, ownerId, leaseMs, DEMO_API_LOCK_NAME);
-      if (lost || !result.acquired || result.epoch !== epoch || performance.now() >= previousDeadline) {
-        // CONFIRMED loss -- another owner (or a re-seeded fresh row) now
-        // holds it. Never reacquire and continue; declare loss now.
-        declareLost();
-        return;
-      }
-      // Anchor before the DB call: response latency must not extend validity.
-      leaseValidUntil = requestStartedAt + leaseMs;
+      result = await tryAcquireOrRenewExclusiveLock(pool, ownerId, leaseMs, DEMO_API_LOCK_NAME);
     } catch {
       // A transient DB error is NOT confirmed loss -- `leaseValidUntil`
       // is deliberately left UNCHANGED here. If renewals keep failing
       // long enough for that already-tracked deadline to pass, the
-      // watchdog below declares loss on its own, independent of ever
-      // receiving an explicit "not acquired" answer.
+      // watchdog (or the next renewal's own checkExpiryNow) declares
+      // loss on its own, independent of ever receiving an explicit
+      // "not acquired" answer.
+      return;
     }
+
+    // A response that arrives after loss was ALREADY declared (by the
+    // watchdog, or by another path, while this call was in flight) is
+    // stale -- discarded outright, never used to extend validity or
+    // otherwise treated as if ownership had been continuous.
+    if (lost) return;
+
+    if (!result.acquired) {
+      // CONFIRMED loss -- another owner (or a re-seeded fresh row) now
+      // holds it. Never reacquire and continue; declare loss now.
+      declareLost();
+      return;
+    }
+    if (result.epoch !== currentEpoch) {
+      // The row's epoch only changes when a lease is claimed after
+      // having been allowed to EXPIRE (see publisher-lock.ts's epoch
+      // CASE) -- even if the `owner_id` this acquisition reports back
+      // is still OUR OWN, a changed epoch proves this row went through
+      // a real expiry-and-reclaim cycle, not an uninterrupted renewal.
+      // Ownership continuity is not guaranteed across that gap (another
+      // owner could have held it in between), so this is treated as
+      // lost, never as if nothing happened.
+      declareLost();
+      return;
+    }
+    currentEpoch = result.epoch;
+    leaseValidUntil = callStartedAt + leaseMs;
   };
 
   // Prevents overlapping renewals: if a renewal is already in flight
@@ -124,27 +171,31 @@ export async function acquireSingletonLock(
   }, renewIntervalMs);
   renewTimer.unref();
 
-  const watchdogTimer = setInterval(() => {
-    if (lost) return;
-    if (performance.now() >= leaseValidUntil) declareLost();
-  }, watchdogIntervalMs);
+  const watchdogTimer = setInterval(checkExpiryNow, watchdogIntervalMs);
   watchdogTimer.unref();
 
   return {
     ownerId,
     isLost: () => {
-      if (!lost && performance.now() >= leaseValidUntil) declareLost();
+      // Checked synchronously on every call, not only on a watchdog
+      // tick's own cadence -- admission/status checks (server.ts calls
+      // this directly) must never observe a stale "not lost" answer
+      // merely because the next scheduled tick hasn't fired yet.
+      checkExpiryNow();
       return lost;
     },
     stop: async () => {
       clearInterval(renewTimer);
       clearInterval(watchdogTimer);
       if (renewing) await renewing.catch(() => {});
-      // Release only this acquisition. Never clear a successor's lease.
-      await pool.query({
-        sql: "UPDATE publisher_leader SET owner_id = NULL, lease_expires_at = NULL WHERE lock_name = ? AND owner_id = ? AND epoch = ?",
-        timeout: 2000,
-      }, [DEMO_API_LOCK_NAME, ownerId, epoch]);
+      if (lost) return;
+      // Released explicitly (still-owned, same epoch only) so a clean
+      // restart need not wait out the lease. The next acquirer gets a
+      // NEW epoch, since this owner no longer matches the row.
+      lost = true;
+      await pool
+        .query(`UPDATE publisher_leader SET owner_id = NULL, lease_expires_at = NULL WHERE lock_name = ? AND owner_id = ? AND epoch = ?`, [DEMO_API_LOCK_NAME, ownerId, currentEpoch])
+        .catch(() => {});
     },
   };
 }

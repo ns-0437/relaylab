@@ -11,9 +11,9 @@ around cross-device coding agents. Not affiliated with Capy, does not
 reproduce proprietary internals, and does not claim to fix any specific
 unresolved Capy bug.
 
-## Current status: local demo published; final product acceptance remains incomplete
+## Current status: Demo UI acceptance complete
 
-Current release evidence and remaining work: [release validation](docs/RELEASE-2026-10-17.md). The milestone notes below are historical and must not override this status.
+The remaining acceptance work listed in [the 2026-10-17 release notes](docs/RELEASE-2026-10-17.md) (no checked-in automated browser suite; verification progress summarized only after worker calls return; one lifecycle per process) is now closed: `tests/e2e/demo-ui.test.ts` (`npm run test:e2e-ui`) drives the real built UI in headless Chromium against real MySQL/Docker; `src/worker/run-task-ai.ts` reports per-attempt/verification progress as each transition happens, not only after the worker function returns; and executor lifecycle state (`src/api/executor.ts`) is now built per API server instance (`createExecutor()`), not a module global, so a lock-loss or shutdown in one instance can never block admission for another in the same process. The singleton lock's lease tracking was also hardened: validity is anchored to when a renewal call STARTS (never when its response arrives), checked synchronously before each renewal/admission check (not only on a watchdog tick), and a renewal whose epoch has changed is treated as lost even when its own response says "acquired". Full detail: README.md "Demo UI". The milestone notes below are historical and must not override this status.
 
 **Demo UI release-readiness pass, this session**: a review of the Demo
 UI (below) found concrete, real defects, all fixed. Full setup, API

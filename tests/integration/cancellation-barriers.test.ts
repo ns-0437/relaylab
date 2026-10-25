@@ -190,7 +190,14 @@ test("deterministic path: the signal is genuinely propagated into Docker verific
 });
 
 test("worker B restore re-verification: cancelling at the moment B's real container is confirmed running leaves no acknowledgement, never undoing anything already durable", async () => {
-  const fixture = await createSlowFixtureRepo(path.join(fixtureParentDir, uniqueId("slow-restore")));
+  // The SLOW test-only fixture (see the file header and worker A's own
+  // test above) -- B re-verifies the RESTORED artifact, which carries
+  // the same slow verify.js, so B's own container stays confirmed
+  // running long enough for a genuine mid-container barrier. No
+  // scheduling trick (an earlier version of this test used
+  // `setImmediate` as a timing guess instead of a real barrier).
+  const fixtureDir = path.join(fixtureParentDir, uniqueId("slow-fixture-b"));
+  const fixture = await createSlowFixtureRepo(fixtureDir);
   const taskId = uniqueId("cancel-restore-task");
   const ownerA = "worker-cancel-restore-a";
   const claimResult = await claim(taskId, ownerA);
@@ -248,6 +255,7 @@ test("worker B restore re-verification: cancelling at the moment B's real contai
   const managedRootB = await createManagedWorkspaceRoot(path.join(workspaceBRoot, "home"));
   const envB = makeIsolatedGitEnv(resolveIsolatedHomeDir(managedRootB));
   const controller = new AbortController();
+  let observedContainerId: string | undefined;
 
   const restoreOutcome = await restoreAndAcknowledge(pool, {
     taskId,
@@ -259,12 +267,20 @@ test("worker B restore re-verification: cancelling at the moment B's real contai
     destRepoDir,
     env: envB,
     signal: controller.signal,
-    onVerifyContainerCreated: () => {
-      setImmediate(() => controller.abort());
+    onVerifyContainerCreated: (containerId) => {
+      observedContainerId = containerId;
+      // The restored artifact carries the SAME slow verify.js (3s
+      // busy-wait), so this real, confirmed-running container is still
+      // alive when the signal fires -- a genuine barrier, not a guess.
+      controller.abort();
     },
   });
 
+  assert.ok(observedContainerId, "the container-confirmed-running barrier must have fired for B's re-verification");
   assert.equal(restoreOutcome.kind, "verification_cancelled", `expected verification_cancelled, got ${restoreOutcome.kind}`);
+
+  const gone = await containerIsGone(observedContainerId!);
+  assert.ok(gone, "B's owned container must be stopped and removed after cancellation");
 
   // A's own checkpoint must still stand -- cancellation of B's restore
   // must never be mistaken for undoing A's already-durable work.
@@ -273,7 +289,15 @@ test("worker B restore re-verification: cancelling at the moment B's real contai
 
   const taskAfterCancel = await Effect.runPromise(store.getTask(taskId));
   assert.equal(taskAfterCancel.checkpointDigest, taskAfterA.checkpointDigest, "A's checkpoint digest must be unchanged");
-  const [handoffs] = await pool.query(`SELECT restore_ack_command_id FROM task_handoffs WHERE task_id = ? AND handoff_id = ?`, [taskId, handoffCommandId(taskId, handoffId)]);
-  assert.equal((handoffs as { restore_ack_command_id: string | null }[]).length, 1);
-  assert.equal((handoffs as { restore_ack_command_id: string | null }[])[0]!.restore_ack_command_id, null, "cancelled B must not acknowledge the handoff");
+
+  // The acknowledgement state is queried DIRECTLY from the durable
+  // handoff row -- never inferred solely from restoreOutcome's return
+  // value -- proving no restore acknowledgement was ever recorded for
+  // this cancelled attempt.
+  const [handoffRows] = await pool.query<{ restore_ack_command_id: string | null }[] & import("mysql2/promise").RowDataPacket[]>(
+    `SELECT restore_ack_command_id FROM task_handoffs WHERE task_id = ? AND handoff_id = ?`,
+    [taskId, handoffCommandId(taskId, handoffId)],
+  );
+  assert.equal(handoffRows.length, 1, "the handoff row itself must exist (the transfer succeeded; only the restore/ack was cancelled)");
+  assert.equal(handoffRows[0]!.restore_ack_command_id, null, "no restore acknowledgement must be recorded for a cancelled restore");
 });

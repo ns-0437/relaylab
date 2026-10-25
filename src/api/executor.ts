@@ -7,15 +7,23 @@
 // records progress into demo_runs for the UI to poll.
 //
 // Explicitly a SINGLE local in-process execution model: one run active
-// at a time, tracked by an in-memory AbortController. This is NOT a
+// per executor, tracked by an in-memory AbortController. This is NOT a
 // distributed queue/worker pool -- restarting this process necessarily
 // loses any in-flight run (there is nothing to resume a JS Promise
 // from), which is exactly why reconcileOnStartup (runs-store.ts) exists.
+//
+// All mutable lifecycle state (the active reservation, the admission
+// block, pending degraded terminal results) lives inside ONE executor
+// instance created per API server by `createExecutor()` -- never in
+// module globals -- so a second server lifecycle in the same process
+// (tests do this; a future embedding could too) never inherits a
+// previous lifecycle's permanent admission block or active slot.
 import { randomUUID } from "node:crypto";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type mysql from "mysql2/promise";
+import type { RowDataPacket } from "mysql2/promise";
 import { Effect } from "effect";
 import Anthropic from "@anthropic-ai/sdk";
 import { makeTaskStoreLive } from "../db/task-store.js";
@@ -23,11 +31,11 @@ import { createFixtureRepo } from "../worker/fixture-repo.js";
 import { createManagedWorkspaceRoot, resolveWorktreePath, resolveIsolatedHomeDir } from "../worker/workspace.js";
 import { makeIsolatedGitEnv } from "../worker/git.js";
 import { runGitWorkerTask, defaultAttemptId, branchNameFor } from "../worker/run-task.js";
-import { runAiRepairTask } from "../worker/run-task-ai.js";
+import { runAiRepairTask, type AiProgressEvent } from "../worker/run-task-ai.js";
 import type { AiRepairAttemptRecord } from "../worker/ai-repair.js";
 import { createAnthropicClient, loadAnthropicAdapterConfig, AnthropicAdapterError, type MessagesClient } from "../ai/anthropic-client.js";
 import { prepareHandoffArtifact, requestOwnershipTransfer, restoreAndAcknowledge, handoffCommandId } from "../worker/handoff.js";
-import { insertRun, updateRunStatus, type RunDetail, type RunMode } from "./runs-store.js";
+import { insertRun, updateRunStatus, type RunDetail, type RunMode, type RunStatus } from "./runs-store.js";
 
 export class RunConflictError extends Error {}
 export class AdmissionBlockedError extends Error {}
@@ -38,47 +46,60 @@ export class RunStartError extends Error {
     super(message);
   }
 }
+/** A progress write was refused because the row is already terminal -- a successor (or reconciliation) has decided this run's outcome; this executor must stop, never overwrite it. */
+class StaleRunError extends Error {}
+
+export type StageHookName = "generation" | "checkpoint" | "transfer" | "restore_ack";
+
+/**
+ * TEST-ONLY seams, reachable solely through `createApiServer(options)`
+ * in-process -- never from an HTTP request. Production passes none.
+ */
+export interface ExecutorTestOptions {
+  /** Replaces the simulated provider (never the live one) -- lets a test drive a deterministic failing response without any network call. */
+  simulatedClient?: () => MessagesClient;
+  /** Awaited immediately before each named stage begins; lets a test hold a run at a known point instead of guessing with sleeps. */
+  beforeStage?: (stage: StageHookName, runId: string) => Promise<void>;
+}
 
 interface ActiveRun {
   runId: string;
   controller: AbortController;
-  /** Awaited by graceful shutdown (server.ts) before the process exits -- "await execution cleanup before releasing the active slot" applies here too: shutdown never exits while this is still settling. */
+  /** The ONE lifecycle promise for this reservation -- see startRun. */
   promise: Promise<void>;
 }
 
-let active: ActiveRun | null = null;
-
-export function activeRunId(): string | null {
-  return active?.runId ?? null;
+interface PendingTerminal {
+  status: RunStatus;
+  patch: Partial<RunDetail>;
 }
 
-/**
- * Blocked permanently once set -- used when this process can no longer
- * establish ownership of the singleton lock (confirmed loss, or the
- * conservative expiry watchdog), and during graceful shutdown. A
- * STALE instance that has lost the lock must never admit a new run
- * (which would let it overwrite a SUCCESSOR instance's lifecycle
- * state in demo_runs) -- there is no "unblock" function; a new process
- * is required.
- */
-let admissionBlocked = false;
-export function blockAdmission(): void {
-  admissionBlocked = true;
+export interface Executor {
+  startRun(pool: mysql.Pool, mode: RunMode, confirmPaidCall: boolean): Promise<{ runId: string }>;
+  cancelRun(runId: string): void;
+  activeRunId(): string | null;
+  /** Awaited by graceful shutdown. Resolves immediately if nothing is active. */
+  awaitActiveRun(): Promise<void>;
+  /** Permanent for THIS executor -- used on confirmed lock loss and during shutdown. */
+  blockAdmission(): void;
+  cancelActiveRunForLockLoss(): void;
+  /** Sanitized note for a run whose terminal outcome is known in memory but not yet durably recorded. */
+  degradedRunNote(runId: string): string | undefined;
+  /** Bounded, non-overlapping retry of pending terminal writes; safe to call often (throttled internally). */
+  reconcileDegraded(pool: mysql.Pool): Promise<void>;
 }
 
-/** Aborts the currently active run's controller, if any -- used when the singleton lock is confirmed lost, so a stale instance's execution stops promptly rather than running to completion and overwriting a successor's view of demo_runs. */
-export function cancelActiveRunForLockLoss(): void {
-  active?.controller.abort();
-}
-
-/** Awaited by graceful shutdown. Resolves immediately if nothing is active. */
-export async function awaitActiveRun(): Promise<void> {
-  if (active) await active.promise.catch(() => {});
-}
+const DEGRADED_NOTE = "outcome not yet durably recorded -- the database write for this run's final status failed; it will be retried automatically once storage is reachable";
+const RECONCILE_MIN_INTERVAL_MS = 1_000;
 
 /** The ONE simulated response the demo mode's fake client returns -- the real, correct fix, clearly labeled. Never used for "ai-live". */
-function simulatedClient(): MessagesClient {
+function defaultSimulatedClient(): MessagesClient {
   const correctFix = "function add(a, b) {\n  return a + b;\n}\n\nmodule.exports = { add };\n";
+  return simulatedClientReturning(correctFix);
+}
+
+/** Builds a no-network fake provider that always proposes `fileContent` for src/add.js. */
+export function simulatedClientReturning(fileContent: string): MessagesClient {
   return {
     messages: {
       create: (async () =>
@@ -87,7 +108,7 @@ function simulatedClient(): MessagesClient {
           type: "message",
           role: "assistant",
           model: "claude-opus-5-5-simulated-demo",
-          content: [{ type: "text", text: JSON.stringify({ edits: [{ path: "src/add.js", content: correctFix }] }), citations: null }],
+          content: [{ type: "text", text: JSON.stringify({ edits: [{ path: "src/add.js", content: fileContent }] }), citations: null }],
           stop_reason: "end_turn",
           stop_sequence: null,
           usage: { input_tokens: 40, output_tokens: 12, cache_creation_input_tokens: null, cache_read_input_tokens: null, server_tool_use: null, service_tier: null },
@@ -133,300 +154,357 @@ function classifyError(err: unknown): { code: string; message: string } {
   return { code: "internal_error", message: "an internal error occurred running this task" };
 }
 
-/**
- * Starts exactly one run if none is currently active; otherwise throws
- * `RunConflictError`. `confirmPaidCall` is REQUIRED (and server-side
- * `RELAYLAB_LIVE_MODE=1` + credentials must ALSO be present) for
- * `mode: "ai-live"` -- this function never silently downgrades a
- * requested live run to simulated on any failure of that check; it
- * refuses outright.
- *
- * CONFIRMED real defect, fixed here: `active` used to be set only AFTER
- * `await insertRun(...)` resolved, leaving a window where two
- * concurrent calls could both pass the `if (active)` check above and
- * both proceed to insert/execute. `active` is now reserved
- * SYNCHRONOUSLY, as the very next statement after that check and
- * BEFORE this function's first `await` -- a second concurrent call
- * cannot observe `active` as unset once the first call's synchronous
- * prefix has run, which JavaScript's own run-to-completion semantics
- * guarantee happens before the second call's own synchronous prefix
- * ever starts. The reservation's own `promise` field covers BOTH the
- * pending-insertion window and (once insertion succeeds) real
- * execution, so a failed insertion still releases it correctly, and
- * `awaitActiveRun` (graceful shutdown) can await either phase.
- */
-export async function startRun(pool: mysql.Pool, mode: RunMode, confirmPaidCall: boolean): Promise<{ runId: string }> {
-  if (admissionBlocked) {
-    throw new AdmissionBlockedError("this server instance can no longer establish ownership of the singleton lock (or is shutting down) -- refusing to start a new run");
+export function createExecutor(testOptions: ExecutorTestOptions = {}): Executor {
+  let active: ActiveRun | null = null;
+  let admissionBlocked = false;
+  const pendingTerminal = new Map<string, PendingTerminal>();
+  let reconciling: Promise<void> | null = null;
+  let lastReconcileAt = 0;
+
+  /** Non-terminal transition: refused (row already terminal) means a successor decided this run -- stop. */
+  async function write(pool: mysql.Pool, runId: string, status: RunStatus, patch: Partial<RunDetail>): Promise<void> {
+    const applied = await updateRunStatus(pool, runId, status, patch);
+    if (!applied) throw new StaleRunError(`run ${runId} already has a terminal status recorded elsewhere`);
   }
-  if (active) {
-    throw new RunConflictError(`a run (${active.runId}) is already active -- this demo supports one active run at a time; cancel it first or wait for it to finish`);
+
+  /** Best-effort progress (attempt/verification-start): never aborts the run on a storage blip, never overwrites a terminal row. */
+  async function progress(pool: mysql.Pool, runId: string, patch: Partial<RunDetail>): Promise<void> {
+    await updateRunStatus(pool, runId, "running", patch).catch(() => false);
   }
-  if (mode === "ai-live") {
-    if (process.env.RELAYLAB_LIVE_MODE !== "1") {
-      throw new LiveModeDisabledError("live mode is disabled on this server -- set RELAYLAB_LIVE_MODE=1 server-side to enable it");
-    }
-    if (!confirmPaidCall) {
-      throw new LiveModeDisabledError("live mode requires explicit confirmation (confirmPaidCall: true) that starting it incurs real Anthropic API charges");
-    }
-    if (!process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN) {
-      throw new LiveModeDisabledError("live mode is enabled but no ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN is configured on this server");
-    }
-    if (!process.env.RELAYLAB_AI_MODEL && process.env.RELAYLAB_AI_ALLOW_DEFAULT_MODEL !== "1") {
-      throw new LiveModeDisabledError("live mode requires RELAYLAB_AI_MODEL to be set explicitly (or RELAYLAB_AI_ALLOW_DEFAULT_MODEL=1)");
+
+  /** Terminal transition: never throws. A storage failure keeps the SANITIZED result in memory for later reconciliation. */
+  async function writeTerminal(pool: mysql.Pool, runId: string, status: RunStatus, patch: Partial<RunDetail>): Promise<void> {
+    try {
+      await updateRunStatus(pool, runId, status, patch);
+      pendingTerminal.delete(runId);
+    } catch {
+      pendingTerminal.set(runId, { status, patch });
     }
   }
 
-  const runId = `run-${randomUUID()}`;
-  const taskId = `demo-task-${randomUUID()}`;
-  const ownerId = `demo-api-${runId}`;
-  const controller = new AbortController();
-
-  // One stable promise covers insertion AND execution. Shutdown may already
-  // be awaiting this promise while insertion is pending; never replace it.
-  let releasePending: () => void;
-  const reservation: ActiveRun = { runId, controller, promise: new Promise<void>((resolve) => (releasePending = resolve)) };
-  active = reservation;
-
-  try {
-    await insertRun(pool, { runId, taskId, mode, status: "starting", ownerId, detail: { stage: "generation" } });
-  } catch (err) {
-    // Release ONLY this reservation -- and only if it is STILL the
-    // active one (defensive; nothing else can legitimately have
-    // replaced it mid-insert, but never clear a DIFFERENT reservation
-    // by accident).
-    if (active === reservation) active = null;
-    releasePending!();
-    const classified = classifyError(err);
-    throw new RunStartError(classified.code, classified.message);
+  async function hold(stage: StageHookName, runId: string): Promise<void> {
+    if (testOptions.beforeStage) await testOptions.beforeStage(stage, runId);
   }
 
-  const execPromise = executeRun(pool, runId, taskId, ownerId, mode, controller.signal).catch(() => {
-    /* executeRun itself records failures into demo_runs; nothing further to do here. */
-  });
-  void execPromise.finally(() => {
-    if (active === reservation) active = null;
-    releasePending!();
-  });
+  async function executeRun(pool: mysql.Pool, runId: string, taskId: string, ownerId: string, mode: RunMode, signal: AbortSignal): Promise<void> {
+    try {
+      await hold("generation", runId);
+      await write(pool, runId, "running", { stage: "generation" });
 
-  return { runId };
-}
+      // Temporary-directory setup is INSIDE the guarded lifecycle -- a
+      // failure here (disk full, permissions) is caught below and
+      // recorded as a real "failed" status, never left silently stuck.
+      const demoRoot = await mkdtemp(path.join(tmpdir(), "relaylab-demo-ui-run-"));
+      const fixtureDir = path.join(demoRoot, "fixture-repo");
 
-export function cancelRun(runId: string): void {
-  if (!active || active.runId !== runId) {
-    throw new Error(`no active run with id ${runId}`);
-  }
-  active.controller.abort();
-}
+      const fixture = await createFixtureRepo(fixtureDir);
+      const managedWorkspaceRoot = await createManagedWorkspaceRoot(path.join(demoRoot, "workspace-a"));
+      const store = makeTaskStoreLive(pool);
+      const claim = await Effect.runPromise(store.claimTask(taskId, ownerId, 120_000));
 
-async function executeRun(pool: mysql.Pool, runId: string, taskId: string, ownerId: string, mode: RunMode, signal: AbortSignal): Promise<void> {
-  try {
-    if (signal.aborted) {
-      await updateRunStatus(pool, runId, "cancelled", { stage: "generation" });
-      return;
-    }
-    await updateRunStatus(pool, runId, "running", { stage: "generation" });
+      let resultCommit: string | undefined;
+      let resultTree: string | undefined;
+      let baseCommit: string | undefined;
+      let verificationOutcome: string | undefined;
 
-    // Temporary-directory setup is now INSIDE the guarded lifecycle --
-    // a failure here (disk full, permissions) is caught below and
-    // recorded as a real "failed" status, never left silently stuck at
-    // "starting"/"running" forever with no explanation.
-    const demoRoot = await mkdtemp(path.join(tmpdir(), "relaylab-demo-ui-run-"));
-    const fixtureDir = path.join(demoRoot, "fixture-repo");
-
-    const fixture = await createFixtureRepo(fixtureDir);
-    const managedWorkspaceRoot = await createManagedWorkspaceRoot(path.join(demoRoot, "workspace-a"));
-    const store = makeTaskStoreLive(pool);
-    const claim = await Effect.runPromise(store.claimTask(taskId, ownerId, 120_000));
-
-    let resultCommit: string | undefined;
-    let resultTree: string | undefined;
-    let baseCommit: string | undefined;
-    let verificationOutcome: string | undefined;
-    let checkpointed = false;
-
-    if (mode === "deterministic") {
-      const outcome = await runGitWorkerTask({ taskId, ownerId, epoch: claim.epoch, sourceRepoDir: fixture.repoDir, requestedCommitRef: fixture.baseCommit, managedWorkspaceRoot, pool, signal });
-      verificationOutcome = outcome.verification.outcome;
-      if (outcome.kind === "checkpointed") {
-        checkpointed = true;
+      if (mode === "deterministic") {
+        const outcome = await runGitWorkerTask({
+          taskId,
+          ownerId,
+          epoch: claim.epoch,
+          sourceRepoDir: fixture.repoDir,
+          requestedCommitRef: fixture.baseCommit,
+          managedWorkspaceRoot,
+          pool,
+          signal,
+          // Recorded the moment Docker confirms the verification
+          // container is running -- not after the worker returns.
+          onVerifyContainerCreated: () => progress(pool, runId, { stage: "verification" }),
+        });
+        verificationOutcome = outcome.verification.outcome;
+        if (outcome.kind !== "checkpointed") {
+          // The deterministic repair step itself cannot fail (a fixed,
+          // local substitution) -- every non-checkpointed outcome here
+          // genuinely reached real verification.
+          await writeTerminal(pool, runId, outcome.kind === "verification_cancelled" || signal.aborted ? "cancelled" : "failed", {
+            stage: "verification",
+            verificationOutcome,
+            error: `verification did not succeed: ${outcome.kind}`,
+          });
+          return;
+        }
         baseCommit = outcome.manifest.baseCommit;
         resultCommit = outcome.manifest.resultCommit;
         resultTree = outcome.manifest.resultTree;
       } else {
-        // The deterministic repair step itself cannot fail (it is a
-        // fixed, local string substitution) -- every non-checkpointed
-        // outcome here genuinely reached real verification, so "stage:
-        // verification" is factual, never assumed.
-        await updateRunStatus(pool, runId, outcome.kind === "verification_cancelled" ? "cancelled" : "failed", {
-          stage: "verification",
-          verificationOutcome,
-          error: `verification did not succeed: ${outcome.kind}`,
+        const client = mode === "ai-live" ? createAnthropicClient() : (testOptions.simulatedClient ?? defaultSimulatedClient)();
+        const aiConfig = mode === "ai-live" ? loadAnthropicAdapterConfig() : { model: "claude-opus-5-5-simulated-demo", maxOutputTokens: 512, requestTimeoutMs: 10_000 };
+        // Each transition is persisted AS IT HAPPENS. A retry after a
+        // failed verification moves the stage back to "generation" with
+        // the earlier attempt's real "failed" verification outcome still
+        // listed -- never presented as a successful stage.
+        const onProgress = async (event: AiProgressEvent): Promise<void> => {
+          const attempts = mapAttempts(event.attempts);
+          if (event.kind === "verification_started" || event.kind === "attempt_verified") {
+            await progress(pool, runId, { stage: "verification", attempts });
+          } else {
+            await progress(pool, runId, { stage: "generation", attempts });
+          }
+        };
+        const result = await runAiRepairTask({
+          taskId,
+          ownerId,
+          epoch: claim.epoch,
+          sourceRepoDir: fixture.repoDir,
+          requestedCommitRef: fixture.baseCommit,
+          managedWorkspaceRoot,
+          pool,
+          aiClient: client,
+          aiConfig,
+          signal,
+          onProgress,
         });
-        return;
-      }
-    } else {
-      const client = mode === "ai-live" ? createAnthropicClient() : simulatedClient();
-      const aiConfig = mode === "ai-live" ? loadAnthropicAdapterConfig() : { model: "claude-opus-5-5-simulated-demo", maxOutputTokens: 512, requestTimeoutMs: 10_000 };
-      const result = await runAiRepairTask({
-        taskId,
-        ownerId,
-        epoch: claim.epoch,
-        sourceRepoDir: fixture.repoDir,
-        requestedCommitRef: fixture.baseCommit,
-        managedWorkspaceRoot,
-        pool,
-        aiClient: client,
-        aiConfig,
-        signal,
-      });
-      if ("verification" in result.outcome) verificationOutcome = result.outcome.verification.outcome;
-      if (result.outcome.kind === "checkpointed") {
-        checkpointed = true;
+        if ("verification" in result.outcome) verificationOutcome = result.outcome.verification.outcome;
+        if (result.outcome.kind !== "checkpointed") {
+          // FACTUAL stage: only an attempt that actually produced a
+          // verificationOutcome proves real verification occurred.
+          const anyVerified = result.attempts.some((a) => a.verificationOutcome !== undefined);
+          await writeTerminal(pool, runId, result.outcome.kind === "verification_cancelled" || signal.aborted ? "cancelled" : "failed", {
+            stage: anyVerified ? "verification" : "generation",
+            attempts: mapAttempts(result.attempts),
+            verificationOutcome,
+            error: `${anyVerified ? "verification" : "generation"} did not succeed: ${result.outcome.kind}`,
+          });
+          return;
+        }
         baseCommit = result.outcome.manifest.baseCommit;
         resultCommit = result.outcome.manifest.resultCommit;
         resultTree = result.outcome.manifest.resultTree;
-        await updateRunStatus(pool, runId, "running", { stage: "checkpoint", attempts: mapAttempts(result.attempts) });
-      } else {
-        // FACTUAL stage, derived from what actually happened: if no
-        // attempt ever reached a real verification run (every attempt
-        // was rejected/no_change/a provider error before a commit ever
-        // existed to verify), this never ran verification at all --
-        // "stage: generation" stays accurate. Only an attempt that
-        // actually produced a verificationOutcome proves real
-        // verification occurred.
-        const anyVerified = result.attempts.some((a) => a.verificationOutcome !== undefined);
-        const cancelledKinds = new Set(["verification_cancelled"]);
-        await updateRunStatus(pool, runId, cancelledKinds.has(result.outcome.kind) || signal.aborted ? "cancelled" : "failed", {
-          stage: anyVerified ? "verification" : "generation",
-          attempts: mapAttempts(result.attempts),
-          verificationOutcome,
-          error: `${anyVerified ? "verification" : "generation"} did not succeed: ${result.outcome.kind}`,
+        await progress(pool, runId, { attempts: mapAttempts(result.attempts) });
+      }
+
+      // Checkpoint success is derived from DURABLE state: the task row's
+      // recorded checkpoint digest, not merely the worker's return value.
+      const taskAfter = await Effect.runPromise(store.getTask(taskId));
+      if (!taskAfter.checkpointDigest) throw new Error("worker reported a checkpoint but no durable checkpoint digest is recorded");
+      await hold("checkpoint", runId);
+      await write(pool, runId, "checkpointed", { stage: "checkpoint", baseCommit, resultCommit, resultTree, verificationOutcome, checkpointDigest: taskAfter.checkpointDigest });
+
+      // Checked before starting the NEXT stage -- a checkpoint that
+      // already published stays reported; this only stops progress.
+      await hold("transfer", runId);
+      if (signal.aborted) {
+        await writeTerminal(pool, runId, "cancelled", { stage: "transfer", error: "cancelled after the checkpoint was published; no transfer was started" });
+        return;
+      }
+
+      await write(pool, runId, "transferring", { stage: "transfer" });
+      const attemptId = defaultAttemptId(taskId);
+      const worktreeDirA = resolveWorktreePath(managedWorkspaceRoot, taskId, attemptId);
+      const envA = makeIsolatedGitEnv(resolveIsolatedHomeDir(managedWorkspaceRoot));
+      const handoffId = `demo-handoff-${runId}`;
+      const { artifactPath, manifestPath, manifest } = await prepareHandoffArtifact({
+        taskId,
+        handoffId,
+        worktreeDir: worktreeDirA,
+        env: envA,
+        resultRef: branchNameFor(taskId),
+        sourceCheckpointCommandId: `git-checkpoint-${taskId}`,
+        sourceManifestDigest: taskAfter.checkpointDigest,
+        baseCommit: baseCommit!,
+        resultCommit: resultCommit!,
+        resultTree: resultTree!,
+        outDir: path.join(demoRoot, "artifacts"),
+      });
+
+      if (signal.aborted) {
+        await writeTerminal(pool, runId, "cancelled", { stage: "transfer", artifactDigest: manifest.artifactDigest });
+        return;
+      }
+
+      const ownerB = `${ownerId}-worker-b`;
+      const transfer = await requestOwnershipTransfer(pool, {
+        taskId,
+        handoffId: handoffCommandId(taskId, handoffId),
+        fromOwnerId: ownerId,
+        fromEpoch: taskAfter.epoch,
+        toOwnerId: ownerB,
+        checkpointDigest: taskAfter.checkpointDigest,
+        artifactDigest: manifest.artifactDigest,
+        leaseMs: 120_000,
+      });
+
+      await hold("restore_ack", runId);
+      await write(pool, runId, "restoring", { stage: "restore_ack", artifactDigest: manifest.artifactDigest });
+      if (signal.aborted) {
+        await writeTerminal(pool, runId, "cancelled", { stage: "restore_ack" });
+        return;
+      }
+
+      const workspaceBRoot = await mkdtemp(path.join(tmpdir(), "relaylab-demo-ui-workspace-b-"));
+      const destRepoDir = path.join(workspaceBRoot, "restored-repo");
+      const managedRootB = await createManagedWorkspaceRoot(path.join(workspaceBRoot, "home"));
+      const envB = makeIsolatedGitEnv(resolveIsolatedHomeDir(managedRootB));
+      const restoreOutcome = await restoreAndAcknowledge(pool, {
+        taskId,
+        handoffId,
+        ownerId: ownerB,
+        epoch: transfer.toEpoch,
+        artifactPath,
+        manifestPath,
+        destRepoDir,
+        env: envB,
+        signal,
+      });
+
+      // Acknowledgement is read back from the durable handoff row, never
+      // inferred from the function's return value alone.
+      const [ackRows] = await pool.query<RowDataPacket[]>(`SELECT restore_ack_command_id FROM task_handoffs WHERE task_id = ?`, [taskId]);
+      const acknowledged = ackRows.some((r) => r.restore_ack_command_id !== null);
+
+      if (restoreOutcome.kind !== "restored" || !acknowledged) {
+        await writeTerminal(pool, runId, restoreOutcome.kind === "verification_cancelled" || signal.aborted ? "cancelled" : "failed", {
+          stage: "restore_ack",
+          acknowledged,
+          error: `restore/acknowledge did not succeed: ${restoreOutcome.kind}${restoreOutcome.kind === "restored" ? " (no durable acknowledgement found)" : ""}`,
         });
         return;
       }
-    }
 
-    await updateRunStatus(pool, runId, "checkpointed", { stage: "checkpoint", baseCommit, resultCommit, resultTree, verificationOutcome });
-
-    // Checked before starting the NEXT stage (transfer) -- a checkpoint
-    // that already published is real and stays reported; this only
-    // stops the run from proceeding further.
-    if (signal.aborted) {
-      await updateRunStatus(pool, runId, "cancelled", { stage: "checkpoint" });
-      return;
-    }
-
-    // Transfer + restore/ack, via the SAME generic handoff.ts this
-    // project already ships -- never a parallel protocol.
-    await updateRunStatus(pool, runId, "transferring", { stage: "transfer" });
-    const taskAfter = await Effect.runPromise(store.getTask(taskId));
-    const attemptId = defaultAttemptId(taskId);
-    const worktreeDirA = resolveWorktreePath(managedWorkspaceRoot, taskId, attemptId);
-    const envA = makeIsolatedGitEnv(resolveIsolatedHomeDir(managedWorkspaceRoot));
-    const handoffId = `demo-handoff-${runId}`;
-    const { artifactPath, manifestPath, manifest } = await prepareHandoffArtifact({
-      taskId,
-      handoffId,
-      worktreeDir: worktreeDirA,
-      env: envA,
-      resultRef: branchNameFor(taskId),
-      sourceCheckpointCommandId: `git-checkpoint-${taskId}`,
-      sourceManifestDigest: taskAfter.checkpointDigest!,
-      baseCommit: baseCommit!,
-      resultCommit: resultCommit!,
-      resultTree: resultTree!,
-      outDir: path.join(demoRoot, "artifacts"),
-    });
-
-    // Checked again before requesting ownership transfer.
-    if (signal.aborted) {
-      await updateRunStatus(pool, runId, "cancelled", { stage: "transfer", artifactDigest: manifest.artifactDigest });
-      return;
-    }
-
-    const ownerB = `${ownerId}-worker-b`;
-    const transfer = await requestOwnershipTransfer(pool, {
-      taskId,
-      handoffId: handoffCommandId(taskId, handoffId),
-      fromOwnerId: ownerId,
-      fromEpoch: taskAfter.epoch,
-      toOwnerId: ownerB,
-      checkpointDigest: taskAfter.checkpointDigest!,
-      artifactDigest: manifest.artifactDigest,
-      leaseMs: 120_000,
-    });
-
-    await updateRunStatus(pool, runId, "restoring", { stage: "restore_ack", artifactDigest: manifest.artifactDigest });
-
-    // Checked before worker B's restore/re-verify/acknowledge begins.
-    if (signal.aborted) {
-      await updateRunStatus(pool, runId, "cancelled", { stage: "restore_ack", artifactDigest: manifest.artifactDigest });
-      return;
-    }
-
-    const workspaceBRoot = await mkdtemp(path.join(tmpdir(), "relaylab-demo-ui-workspace-b-"));
-    const destRepoDir = path.join(workspaceBRoot, "restored-repo");
-    const managedRootB = await createManagedWorkspaceRoot(path.join(workspaceBRoot, "home"));
-    const envB = makeIsolatedGitEnv(resolveIsolatedHomeDir(managedRootB));
-    const restoreOutcome = await restoreAndAcknowledge(pool, {
-      taskId,
-      handoffId,
-      ownerId: ownerB,
-      epoch: transfer.toEpoch,
-      artifactPath,
-      manifestPath,
-      destRepoDir,
-      env: envB,
-      signal,
-    });
-
-    if (restoreOutcome.kind !== "restored") {
-      // restoreAndAcknowledge itself NEVER writes the acknowledgement
-      // unless it fully succeeds -- any non-"restored" outcome here
-      // (including one caused by cancellation during B's
-      // re-verification, which restoreAndAcknowledge checks explicitly
-      // before ever writing the ack) means no durable acknowledgement
-      // exists, so reporting this as cancelled/failed (never
-      // "completed") is accurate, not a guess.
-      const cancelledKinds = new Set(["verification_cancelled"]);
-      await updateRunStatus(pool, runId, cancelledKinds.has(restoreOutcome.kind) || signal.aborted ? "cancelled" : "failed", {
+      await writeTerminal(pool, runId, "completed", {
         stage: "restore_ack",
-        error: `restore/acknowledge did not succeed: ${restoreOutcome.kind}`,
+        restoredCommit: restoreOutcome.restoredCommit,
+        restoredTree: restoreOutcome.restoredTree,
+        restoreVerificationOutcome: restoreOutcome.verification.outcome,
+        acknowledged: true,
       });
-      return;
-    }
-
-    await updateRunStatus(pool, runId, "completed", {
-      stage: "restore_ack",
-      restoredCommit: restoreOutcome.restoredCommit,
-      restoredTree: restoreOutcome.restoredTree,
-      restoreVerificationOutcome: restoreOutcome.verification.outcome,
-      acknowledged: true,
-    });
-  } catch (err) {
-    const classified = classifyError(err);
-    try {
-      await updateRunStatus(pool, runId, signal.aborted ? "cancelled" : "failed", { error: `${classified.code}: ${classified.message}` });
-    } catch {
-      // A failure to even PERSIST the terminal status must not throw
-      // out of this catch block uncaught (that would be an unhandled
-      // rejection in the detached executeRun promise) -- but it is also
-      // never silently treated as success. Recorded in-memory as a
-      // SANITIZED degraded marker (never the raw error) so GET
-      // /api/runs/:id can surface "this run's true final status could
-      // not be durably recorded" instead of showing a stale
-      // "running"/"transferring" row with no explanation. Cleared once
-      // storage recovers and reconcileOnStartup runs on the NEXT
-      // restart (the authoritative recovery path); this marker is only
-      // ever a same-process, same-run, best-effort annotation.
-      degradedRuns.set(runId, "this run's terminal status could not be durably recorded -- the database write itself failed after the run finished");
+    } catch (err) {
+      if (err instanceof StaleRunError) return; // a successor owns this row's outcome now -- never overwrite it
+      const classified = classifyError(err);
+      await writeTerminal(pool, runId, signal.aborted ? "cancelled" : "failed", { error: `${classified.code}: ${classified.message}` });
     }
   }
-}
 
-/** Sanitized, in-memory ONLY -- never a substitute for the durable demo_runs row, which remains the authoritative source once storage recovers. See the catch block above. */
-const degradedRuns = new Map<string, string>();
-export function degradedRunNote(runId: string): string | undefined {
-  return degradedRuns.get(runId);
+  return {
+    activeRunId: () => active?.runId ?? null,
+
+    blockAdmission: () => {
+      admissionBlocked = true;
+    },
+
+    cancelActiveRunForLockLoss: () => {
+      active?.controller.abort();
+    },
+
+    awaitActiveRun: async () => {
+      if (active) await active.promise.catch(() => {});
+    },
+
+    degradedRunNote: (runId) => (pendingTerminal.has(runId) ? DEGRADED_NOTE : undefined),
+
+    reconcileDegraded: (pool) => {
+      if (reconciling) return reconciling;
+      if (pendingTerminal.size === 0 || Date.now() - lastReconcileAt < RECONCILE_MIN_INTERVAL_MS) return Promise.resolve();
+      lastReconcileAt = Date.now();
+      reconciling = (async () => {
+        for (const [runId, pending] of [...pendingTerminal]) {
+          try {
+            // Refused (row already terminal -- e.g. a successor marked it
+            // interrupted) counts as settled: never overwrite it.
+            await updateRunStatus(pool, runId, pending.status, pending.patch);
+            pendingTerminal.delete(runId);
+          } catch {
+            // storage still unreachable -- keep it for the next bounded attempt
+          }
+        }
+      })().finally(() => {
+        reconciling = null;
+      });
+      return reconciling;
+    },
+
+    cancelRun: (runId) => {
+      if (!active || active.runId !== runId) {
+        throw new Error(`no active run with id ${runId}`);
+      }
+      active.controller.abort();
+    },
+
+    /**
+     * Starts exactly one run if none is active; otherwise throws
+     * `RunConflictError`. `confirmPaidCall` is REQUIRED (and server-side
+     * `RELAYLAB_LIVE_MODE=1` + credentials must ALSO be present) for
+     * `mode: "ai-live"` -- never silently downgraded to simulated.
+     *
+     * The reservation is set SYNCHRONOUSLY, before the first `await`, so
+     * two concurrent calls can never both pass the `active` check.
+     * `reservation.promise` is ONE deferred promise whose identity never
+     * changes; it settles exactly once, when the whole lifecycle
+     * (insertion, plus execution and cleanup if insertion succeeded) is
+     * finished. `awaitActiveRun` can therefore never observe completion
+     * early, whichever phase it happens to be called in.
+     */
+    startRun: async (pool, mode, confirmPaidCall) => {
+      if (admissionBlocked) {
+        throw new AdmissionBlockedError("this server instance can no longer establish ownership of the singleton lock (or is shutting down) -- refusing to start a new run");
+      }
+      if (active) {
+        throw new RunConflictError(`a run (${active.runId}) is already active -- this demo supports one active run at a time; cancel it first or wait for it to finish`);
+      }
+      if (mode === "ai-live") {
+        if (process.env.RELAYLAB_LIVE_MODE !== "1") {
+          throw new LiveModeDisabledError("live mode is disabled on this server -- set RELAYLAB_LIVE_MODE=1 server-side to enable it");
+        }
+        if (!confirmPaidCall) {
+          throw new LiveModeDisabledError("live mode requires explicit confirmation (confirmPaidCall: true) that starting it incurs real Anthropic API charges");
+        }
+        if (!process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN) {
+          throw new LiveModeDisabledError("live mode is enabled but no ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN is configured on this server");
+        }
+        if (!process.env.RELAYLAB_AI_MODEL && process.env.RELAYLAB_AI_ALLOW_DEFAULT_MODEL !== "1") {
+          throw new LiveModeDisabledError("live mode requires RELAYLAB_AI_MODEL to be set explicitly (or RELAYLAB_AI_ALLOW_DEFAULT_MODEL=1)");
+        }
+      }
+
+      const runId = `run-${randomUUID()}`;
+      const taskId = `demo-task-${randomUUID()}`;
+      const ownerId = `demo-api-${runId}`;
+      const controller = new AbortController();
+
+      let settleReservation!: () => void;
+      const reservation: ActiveRun = { runId, controller, promise: new Promise<void>((resolve) => (settleReservation = resolve)) };
+      active = reservation;
+      const release = () => {
+        if (active === reservation) active = null;
+        settleReservation();
+      };
+
+      try {
+        await insertRun(pool, { runId, taskId, mode, status: "starting", ownerId, detail: { stage: "generation" } });
+      } catch (err) {
+        release();
+        const classified = classifyError(err);
+        throw new RunStartError(classified.code, classified.message);
+      }
+
+      if (controller.signal.aborted) {
+        // Cancelled while insertion was still pending: normal execution
+        // must never begin. Recording it (and settling the lifecycle)
+        // happens in the background, same as the normal execution path
+        // below -- startRun itself still returns {runId} promptly; only
+        // awaitActiveRun (the SAME lifecycle promise) waits for the
+        // write to actually finish.
+        void writeTerminal(pool, runId, "cancelled", { stage: "generation", error: "cancelled before this run's own insertion had finished recording it" }).finally(release);
+        return { runId };
+      }
+
+      void executeRun(pool, runId, taskId, ownerId, mode, controller.signal)
+        .catch(() => {
+          /* executeRun records its own outcome; nothing further to do here. */
+        })
+        .finally(release);
+
+      return { runId };
+    },
+  };
 }

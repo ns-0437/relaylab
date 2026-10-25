@@ -81,13 +81,20 @@ export async function insertRun(pool: mysql.Pool, run: { runId: string; taskId: 
   ]);
 }
 
-export async function updateRunStatus(pool: mysql.Pool, runId: string, status: RunStatus, detailPatch: Partial<RunDetail>): Promise<void> {
+export const TERMINAL_RUN_STATUSES: readonly RunStatus[] = ["completed", "failed", "cancelled", "interrupted"];
+
+/**
+ * Returns `false` (and changes nothing) when the row is already
+ * terminal. Once an outcome is recorded -- including a successor
+ * instance's "interrupted" from reconcileOnStartup -- no stale owner can
+ * overwrite it with a later write.
+ */
+export async function updateRunStatus(pool: mysql.Pool, runId: string, status: RunStatus, detailPatch: Partial<RunDetail>): Promise<boolean> {
   const [rows] = await pool.query<RowDataPacket[]>(`SELECT detail_json FROM demo_runs WHERE run_id = ?`, [runId]);
   const existing = rows[0] ? (typeof rows[0].detail_json === "string" ? JSON.parse(rows[0].detail_json) : rows[0].detail_json) : {};
   const merged = { ...existing, ...detailPatch };
-  // A successor's startup reconciliation is terminal for the old process.
-  // Late writes from its cancelled executor must not undo that decision.
-  await pool.query(`UPDATE demo_runs SET status = ?, detail_json = ? WHERE run_id = ? AND status <> 'interrupted'`, [status, JSON.stringify(merged), runId]);
+  const [result] = await pool.query(`UPDATE demo_runs SET status = ?, detail_json = ? WHERE run_id = ? AND status NOT IN (?)`, [status, JSON.stringify(merged), runId, TERMINAL_RUN_STATUSES]);
+  return (result as { affectedRows: number }).affectedRows > 0;
 }
 
 export async function getRun(pool: mysql.Pool, runId: string): Promise<RunRow | null> {
