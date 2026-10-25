@@ -17,9 +17,22 @@ import type mysql from "mysql2/promise";
 import { createPool } from "../db/pool.js";
 import { loadMysqlConfig } from "../config.js";
 import { applyMigrations } from "../db/migrate.js";
-import { startRun, cancelRun, activeRunId, awaitActiveRun, RunConflictError, LiveModeDisabledError, RunStartError } from "./executor.js";
+import { createExecutor, RunConflictError, LiveModeDisabledError, RunStartError, AdmissionBlockedError, type ExecutorTestOptions } from "./executor.js";
 import { getRun, listRuns, reconcileOnStartup, type RunMode } from "./runs-store.js";
-import { acquireSingletonLock, type SingletonLock } from "./singleton-lock.js";
+import { acquireSingletonLock, type SingletonLock, type SingletonLockTimings } from "./singleton-lock.js";
+
+/**
+ * Bounded, explicit -- shutdown never waits indefinitely, and never
+ * claims to have finished cleanup if this elapses first. Read fresh
+ * INSIDE createApiServer (not cached as a module-level constant at
+ * import time) -- same "read fresh on every call" pattern already used
+ * for RELAYLAB_LIVE_MODE below, so a test can set this env var right
+ * before calling createApiServer() and have it actually take effect,
+ * regardless of ESM import hoisting order.
+ */
+function shutdownTimeoutMs(): number {
+  return Number(process.env.RELAYLAB_SHUTDOWN_TIMEOUT_MS ?? 15_000);
+}
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const UI_DIR = path.join(HERE, "..", "..", "ui", "dist");
@@ -82,11 +95,24 @@ async function requireJsonMutation(req: IncomingMessage, res: ServerResponse): P
  * navigation) is allowed; a request WITH one must match this server's
  * own loopback origin exactly.
  */
+/**
+ * Loopback-only, by whatever port this server actually bound to -- NOT
+ * the fixed `PORT` env-derived constant, which only reflects the CLI
+ * entry point's own default and is wrong for any instance started on
+ * an ephemeral port (0), such as every test harness (including a real
+ * browser driving the built UI) in this project.
+ */
 function originIsTrusted(req: IncomingMessage): boolean {
   const origin = req.headers.origin;
   if (!origin) return true;
-  const allowed = new Set([`http://127.0.0.1:${PORT}`, `http://localhost:${PORT}`]);
-  return allowed.has(origin);
+  const host = req.headers.host;
+  if (!host) return false;
+  try {
+    const originUrl = new URL(origin);
+    return (originUrl.hostname === "127.0.0.1" || originUrl.hostname === "localhost") && originUrl.protocol === "http:" && `${originUrl.hostname}:${originUrl.port || "80"}` === host;
+  } catch {
+    return false;
+  }
 }
 
 const STATIC_TYPES: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".map": "application/json; charset=utf-8" };
@@ -108,34 +134,70 @@ async function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: 
   }
 }
 
+/**
+ * `timedOut: true` means SHUTDOWN_TIMEOUT_MS elapsed before cleanup
+ * finished -- resources may still be open. `cleanup` settles only when
+ * cleanup has GENUINELY finished (it keeps running after a timeout), so
+ * a caller can tell "deadline elapsed" apart from "cleanup completed".
+ */
+export interface ShutdownResult {
+  timedOut: boolean;
+  cleanup: Promise<void>;
+}
+
 export interface ApiServerHandle {
   server: Server;
   pool: mysql.Pool;
-  /** Bounded graceful shutdown: stop accepting new connections, cancel + await any active run, stop lock renewal, close the pool. Never force-kills an in-flight run's own cleanup. */
-  shutdown: () => Promise<void>;
+  /** Bounded graceful shutdown: admission is blocked and any active run is cancelled IMMEDIATELY; stopping the HTTP server, awaiting the run's own cleanup, releasing the lock, and closing the pool are then raced against SHUTDOWN_TIMEOUT_MS. See ShutdownResult. */
+  shutdown: () => Promise<ShutdownResult>;
 }
 
-export async function createApiServer(): Promise<ApiServerHandle> {
+export interface ApiServerOptions {
+  lockTimings?: SingletonLockTimings;
+  /** TEST-ONLY executor seams (in-process only; no HTTP route reaches them). */
+  executor?: ExecutorTestOptions;
+  /** Refuses ai-live outright regardless of environment -- used by automated tests so a stray RELAYLAB_LIVE_MODE/API key can never cause a paid call. */
+  forbidLiveMode?: boolean;
+}
+
+export async function createApiServer(options: ApiServerOptions = {}): Promise<ApiServerHandle> {
+  const SHUTDOWN_TIMEOUT_MS = shutdownTimeoutMs();
+  const executor = createExecutor(options.executor);
+  const liveModeEnabled = () => !options.forbidLiveMode && process.env.RELAYLAB_LIVE_MODE === "1";
   const pool = createPool(loadMysqlConfig());
-  await applyMigrations(loadMysqlConfig());
+  let lock: SingletonLock | null = null;
+  try {
+    await applyMigrations(loadMysqlConfig());
 
-  // Singleton lock FIRST, reconciliation only AFTER it is confirmed
-  // held -- a second instance against the SAME database must never
-  // reconcile (or otherwise touch) runs the first instance still owns.
-  const lockOwnerId = `demo-api-${process.pid}-${randomUUID()}`;
-  let lockLost = false;
-  const lock: SingletonLock | null = await acquireSingletonLock(pool, lockOwnerId, () => {
-    lockLost = true;
-    console.error("[api] singleton lock lost -- another instance appears to have taken over. Refusing further run starts; existing GET requests still work.");
-  });
-  if (!lock) {
-    await pool.end();
-    throw new Error("another relaylab demo API instance already holds the singleton lock against this database -- refusing to start a second one");
-  }
+    // Singleton lock FIRST, reconciliation only AFTER it is confirmed
+    // held -- a second instance against the SAME database must never
+    // reconcile (or otherwise touch) runs the first instance still owns.
+    const lockOwnerId = `demo-api-${process.pid}-${randomUUID()}`;
+    lock = await acquireSingletonLock(pool, lockOwnerId, () => {
+      // Confirmed lock loss (or the conservative expiry watchdog)
+      // fires exactly once: block all further admission AND cancel any
+      // execution this now-stale instance still has running, so it can
+      // never overwrite a successor instance's view of demo_runs.
+      console.error("[api] singleton lock lost -- another instance appears to have taken over, or this lease could not be confirmed renewed in time. Blocking further run starts and cancelling any active run.");
+      executor.blockAdmission();
+      executor.cancelActiveRunForLockLoss();
+    }, options.lockTimings);
+    if (!lock) {
+      throw new Error("another relaylab demo API instance already holds the singleton lock against this database -- refusing to start a second one");
+    }
 
-  const interrupted = await reconcileOnStartup(pool);
-  if (interrupted > 0) {
-    console.log(`[api] reconciled ${interrupted} run(s) left in an in-flight status by a prior process -- marked "interrupted", never displayed as running.`);
+    const interrupted = await reconcileOnStartup(pool);
+    if (interrupted > 0) {
+      console.log(`[api] reconciled ${interrupted} run(s) left in an in-flight status by a prior process -- marked "interrupted", never displayed as running.`);
+    }
+  } catch (err) {
+    // Startup failure AFTER the pool (and possibly the lock) was
+    // already acquired must still release both -- never leave a lock
+    // lease or a pool connection orphaned just because a LATER startup
+    // step (reconciliation, migrations) failed.
+    await lock?.stop().catch(() => {});
+    await pool.end().catch(() => {});
+    throw err;
   }
 
   let shuttingDown = false;
@@ -163,13 +225,24 @@ export async function createApiServer(): Promise<ApiServerHandle> {
       if (req.method === "GET" && pathname === "/api/status") {
         // Never includes credentials -- only whether live mode is
         // server-side enabled, for the UI's badge.
-        sendJson(res, 200, { liveModeEnabled: process.env.RELAYLAB_LIVE_MODE === "1", allowedModes: ALLOWED_MODES, lockHeld: !lockLost });
+        sendJson(res, 200, { liveModeEnabled: liveModeEnabled(), allowedModes: ALLOWED_MODES, lockHeld: !lock.isLost(), activeRunId: executor.activeRunId() });
         return;
       }
 
       if (req.method === "GET" && pathname === "/api/runs") {
+        // The UI polls THIS endpoint, so degraded runs are surfaced here
+        // too: the durable (possibly stale) row is returned with a
+        // `degraded` note, never presented as a live "running" run.
+        // Reconciliation of pending terminal results is then attempted
+        // (throttled, non-overlapping, never awaited by this response),
+        // so recovery needs no restart once storage is back.
         const rows = await listRuns(pool);
-        sendJson(res, 200, { runs: rows, activeRunId: activeRunId() });
+        const runs = rows.map((r) => {
+          const degraded = executor.degradedRunNote(r.runId);
+          return degraded ? { ...r, degraded } : r;
+        });
+        sendJson(res, 200, { runs, activeRunId: executor.activeRunId() });
+        void executor.reconcileDegraded(pool);
         return;
       }
 
@@ -177,7 +250,7 @@ export async function createApiServer(): Promise<ApiServerHandle> {
         const body = await requireJsonMutation(req, res);
         if (body === undefined) return; // requireJsonMutation already sent the error response
 
-        if (lockLost) {
+        if (lock.isLost()) {
           sendError(res, 503, "singleton_lock_lost", "this server instance no longer holds the singleton lock -- refusing to start a new run");
           return;
         }
@@ -192,13 +265,16 @@ export async function createApiServer(): Promise<ApiServerHandle> {
           return;
         }
         try {
-          const { runId } = await startRun(pool, mode as RunMode, confirmPaidCall === true);
+          if (mode === "ai-live" && options.forbidLiveMode) throw new LiveModeDisabledError("live mode is forbidden on this server instance");
+          const { runId } = await executor.startRun(pool, mode as RunMode, confirmPaidCall === true);
           sendJson(res, 201, { runId });
         } catch (err) {
           if (err instanceof RunConflictError) {
             sendError(res, 409, "run_conflict", err.message);
           } else if (err instanceof LiveModeDisabledError) {
             sendError(res, 403, "live_mode_disabled", err.message);
+          } else if (err instanceof AdmissionBlockedError) {
+            sendError(res, 503, "admission_blocked", err.message);
           } else if (err instanceof RunStartError) {
             sendError(res, 500, err.code, err.message);
           } else {
@@ -210,12 +286,18 @@ export async function createApiServer(): Promise<ApiServerHandle> {
 
       const detailMatch = pathname.match(/^\/api\/runs\/([^/]+)$/);
       if (req.method === "GET" && detailMatch) {
-        const run = await getRun(pool, decodeURIComponent(detailMatch[1]!));
+        const runId = decodeURIComponent(detailMatch[1]!);
+        const run = await getRun(pool, runId);
         if (!run) {
           sendError(res, 404, "not_found", "no run with that id");
           return;
         }
-        sendJson(res, 200, { run });
+        // A sanitized, same-process-only degraded note overlaid when
+        // this run's TRUE terminal status could not be durably
+        // recorded -- the durable row (possibly stale) is still
+        // returned alongside it, never replaced by a guess.
+        const degraded = executor.degradedRunNote(runId);
+        sendJson(res, 200, degraded ? { run, degraded } : { run });
         return;
       }
 
@@ -225,7 +307,7 @@ export async function createApiServer(): Promise<ApiServerHandle> {
         if (body === undefined) return;
         const runId = decodeURIComponent(cancelMatch[1]!);
         try {
-          cancelRun(runId);
+          executor.cancelRun(runId);
           sendJson(res, 202, { cancelling: true });
         } catch {
           sendError(res, 409, "not_active", "this run is not currently active (already finished, or never existed)");
@@ -239,25 +321,45 @@ export async function createApiServer(): Promise<ApiServerHandle> {
     }
   });
 
-  let shutdownOnce: Promise<void> | null = null;
-  const shutdown = (): Promise<void> => {
+  let shutdownOnce: Promise<ShutdownResult> | null = null;
+  /**
+   * Bounded and prompt: admission is blocked and any active run is
+   * cancelled IMMEDIATELY (synchronously, before anything is awaited),
+   * not after waiting for `server.close()`'s own in-flight-connection
+   * drain to finish. Everything else (closing the HTTP server, awaiting
+   * the active run's own cleanup, stopping lock renewal, closing the
+   * pool) runs against an explicit `SHUTDOWN_TIMEOUT_MS` deadline. If
+   * that deadline elapses first, this returns `{ timedOut: true }` --
+   * it NEVER claims `completed: true` merely because the wait ended;
+   * the caller (the CLI entry point below) reports that outcome
+   * honestly rather than assuming cleanup finished.
+   */
+  const shutdown = (): Promise<ShutdownResult> => {
     if (shutdownOnce) return shutdownOnce;
-    shutdownOnce = (async () => {
-      shuttingDown = true;
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      const runningId = activeRunId();
-      if (runningId) {
-        console.log(`[api] shutdown: cancelling and awaiting the active run (${runningId})...`);
-        try {
-          cancelRun(runningId);
-        } catch {
-          /* already finished between the check and the cancel call -- fine. */
-        }
-      }
-      await awaitActiveRun();
-      lock.stopRenewing();
+    shuttingDown = true;
+    executor.blockAdmission();
+    const runningIdAtShutdown = executor.activeRunId();
+    if (runningIdAtShutdown) {
+      console.log(`[api] shutdown: cancelling the active run (${runningIdAtShutdown}) immediately...`);
+      executor.cancelActiveRunForLockLoss();
+    }
+
+    // HTTP close and the active run's own cleanup proceed together; the
+    // lock and pool are released only after both have finished.
+    const cleanup = (async (): Promise<void> => {
+      await Promise.all([new Promise<void>((resolve) => server.close(() => resolve())), executor.awaitActiveRun()]);
+      await lock.stop();
       await pool.end();
     })();
+    cleanup.catch(() => {});
+
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    shutdownOnce = Promise.race([
+      cleanup.then((): ShutdownResult => ({ timedOut: false, cleanup })),
+      new Promise<ShutdownResult>((resolve) => {
+        deadline = setTimeout(() => resolve({ timedOut: true, cleanup }), SHUTDOWN_TIMEOUT_MS);
+      }),
+    ]).finally(() => clearTimeout(deadline)); // a fast shutdown never leaves the deadline timer holding the event loop open
     return shutdownOnce;
   };
 
@@ -272,10 +374,22 @@ if (fileURLToPath(import.meta.url) === process.argv[1]) {
         console.log(`[api] live mode: ${process.env.RELAYLAB_LIVE_MODE === "1" ? "ENABLED server-side (still requires per-request confirmPaidCall)" : "disabled"}`);
       });
       const onSignal = () => {
-        console.log("[api] shutdown signal received -- stopping accepting work, awaiting any active run...");
+        console.log("[api] shutdown signal received -- blocking admission, cancelling any active run immediately...");
         handle
           .shutdown()
-          .then(() => process.exit(0))
+          .then((result) => {
+            if (result.timedOut) {
+              // Honest, not a success: the bounded deadline elapsed
+              // before cleanup (HTTP close / active-run await / lock
+              // release / pool close) actually finished -- never
+              // reported as a clean exit.
+              console.error(`[api] shutdown TIMED OUT after ${shutdownTimeoutMs()}ms -- cleanup may be incomplete.`);
+              process.exit(1);
+            } else {
+              console.log("[api] shutdown complete.");
+              process.exit(0);
+            }
+          })
           .catch((err) => {
             console.error("[api] error during shutdown:", err);
             process.exit(1);
