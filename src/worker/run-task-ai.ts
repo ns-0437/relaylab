@@ -80,7 +80,16 @@ export interface AiRunOutcome {
   attempts: (AiRepairAttemptRecord & { verificationOutcome?: string })[];
 }
 
+/** Emitted as each transition happens, carrying a snapshot of every attempt so far. Never carries prompt/response text. */
+export interface AiProgressEvent {
+  kind: "attempt_started" | "attempt_generated" | "verification_started" | "attempt_verified";
+  attempt: number;
+  attempts: (AiRepairAttemptRecord & { verificationOutcome?: string })[];
+}
+
 export interface RunAiRepairTaskArgs extends RunTaskArgs {
+  /** Awaited at each transition; a throwing callback is ignored -- progress reporting never changes the repair outcome. */
+  onProgress?: (event: AiProgressEvent) => void | Promise<void>;
   /** Injectable for tests -- defaults to the real `createAnthropicClient()` (reads credentials from the environment only). */
   aiClient?: MessagesClient;
   aiConfig?: AnthropicAdapterConfig;
@@ -169,6 +178,13 @@ export async function runAiRepairTask(args: RunAiRepairTaskArgs): Promise<AiRunO
   const tracer = getTracer();
   return tracer.startActiveSpan("relaylab.worker.run_ai_repair_task", async (span): Promise<AiRunOutcome> => {
     const attempts: (AiRepairAttemptRecord & { verificationOutcome?: string })[] = [];
+    const report = async (kind: AiProgressEvent["kind"], attempt: number): Promise<void> => {
+      try {
+        await args.onProgress?.({ kind, attempt, attempts: attempts.map((a) => ({ ...a })) });
+      } catch {
+        // progress reporting is observational only
+      }
+    };
     try {
       span.setAttribute("relaylab.task_id", args.taskId);
       span.setAttribute("relaylab.repair_mode", "ai");
@@ -263,9 +279,11 @@ export async function runAiRepairTask(args: RunAiRepairTaskArgs): Promise<AiRunO
             return { outcome: boundary1.kind === "cancelled" ? { kind: "verification_cancelled", verification: cancelledVerificationPlaceholder() } : { kind: "deadline_exceeded" }, attempts };
           }
 
+          await report("attempt_started", attemptNumber);
           const genSignal = stepSignal(args.signal, deadlineAt);
           record = await attemptAiRepair(worktreeDir, client, config, attemptNumber, diagnostics, genSignal);
           attempts.push(record);
+          await report("attempt_generated", attemptNumber);
 
           if (record.outcome === "cancelled") {
             span.setAttribute("relaylab.outcome", "ai_repair_cancelled");
@@ -297,6 +315,7 @@ export async function runAiRepairTask(args: RunAiRepairTaskArgs): Promise<AiRunO
         }
 
         const pinnedTree = await currentTree(worktreeDir, env);
+        await report("verification_started", attemptNumber);
         const verifySignal = stepSignal(args.signal, deadlineAt);
         const { result: verification, imageId } = await (async () => {
           const materialized = await materializeCandidateInput(worktreeDir, resultCommit, env, path.join(args.managedWorkspaceRoot, ".verify-scratch-ai"));
@@ -311,6 +330,7 @@ export async function runAiRepairTask(args: RunAiRepairTaskArgs): Promise<AiRunO
         if (record) {
           record.verificationOutcome = verification.outcome;
         }
+        await report("attempt_verified", attemptNumber);
 
         if (verification.outcome === "timed_out") {
           span.setAttribute("relaylab.outcome", "verification_timeout");
