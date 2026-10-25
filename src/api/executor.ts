@@ -489,9 +489,12 @@ export function createExecutor(testOptions: ExecutorTestOptions = {}): Executor 
 
       if (controller.signal.aborted) {
         // Cancelled while insertion was still pending: normal execution
-        // must never begin. Record it and settle the same lifecycle.
-        await writeTerminal(pool, runId, "cancelled", { stage: "generation", error: "cancelled before this run's own insertion had finished recording it" });
-        release();
+        // must never begin. Recording it (and settling the lifecycle)
+        // happens in the background, same as the normal execution path
+        // below -- startRun itself still returns {runId} promptly; only
+        // awaitActiveRun (the SAME lifecycle promise) waits for the
+        // write to actually finish.
+        void writeTerminal(pool, runId, "cancelled", { stage: "generation", error: "cancelled before this run's own insertion had finished recording it" }).finally(release);
         return { runId };
       }
 

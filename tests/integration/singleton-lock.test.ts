@@ -124,38 +124,51 @@ test("a delayed-but-successful renewal response arriving AFTER expiry was alread
   // SAME owner, so the DB still lets it "renew" even past expiry), the
   // result must be discarded, never un-declaring loss or extending
   // leaseValidUntil.
+  // Gated on ACQUISITION HAVING ALREADY COMPLETED, not on a call count --
+  // the initial acquisition itself can legitimately issue more than one
+  // "SET epoch" write (truncateAll wipes this lock's row before every
+  // test in this file, so acquireSingletonLock's own self-healing
+  // INSERT-IGNORE-then-retry path runs every time); counting calls to
+  // guess which one is "the first" is exactly the kind of timing guess
+  // this suite otherwise avoids.
   const realQuery = pool.query.bind(pool);
-  let renewalCalls = 0;
+  let acquisitionComplete = false;
   const slowPool = {
     ...pool,
     query: (async (sql: unknown, params?: unknown) => {
       const isRenewalWrite = typeof sql === "string" && sql.includes("SET epoch");
       const call = (realQuery as (sql: unknown, params?: unknown) => Promise<unknown>);
-      if (!isRenewalWrite) return call(sql, params);
-      renewalCalls++;
-      if (renewalCalls === 1) return call(sql, params); // the initial acquisition -- let it through fast
+      if (!isRenewalWrite || !acquisitionComplete) return call(sql, params);
       const result = await call(sql, params);
-      await new Promise((r) => setTimeout(r, 300)); // the delayed RESPONSE, arriving late
+      await new Promise((r) => setTimeout(r, 800)); // the delayed RESPONSE, arriving late
       return result;
     }) as typeof pool.query,
   } as mysql.Pool;
 
   let lostCalls = 0;
+  // leaseMs must stay comfortably ABOVE a normal real acquisition round
+  // trip (acquireSingletonLock itself now refuses an initial
+  // acquisition whose own response arrives after its deadline -- the
+  // same conservatism this test is exercising for renewals), while
+  // staying well BELOW the renewal's artificial 800ms delay above, so
+  // the watchdog declares loss well before that delayed response
+  // arrives.
   const lock = await acquireSingletonLock(slowPool, "owner-delayed-response", () => {
     lostCalls++;
-  }, { leaseMs: 100, renewIntervalMs: 50, watchdogIntervalMs: 20 });
+  }, { leaseMs: 300, renewIntervalMs: 50, watchdogIntervalMs: 20 });
   assert.ok(lock, "initial acquisition must succeed");
+  acquisitionComplete = true; // only NOW does a "SET epoch" write count as a renewal
 
-  // By ~150ms the watchdog must have declared loss (deadline ~100ms
-  // past acquisition), well before the first renewal's delayed (300ms)
-  // response arrives at ~350ms.
-  await new Promise((r) => setTimeout(r, 200));
+  // By ~400ms the watchdog must have declared loss (deadline ~300ms
+  // past acquisition), well before the first renewal's delayed (800ms)
+  // response arrives at ~850ms.
+  await new Promise((r) => setTimeout(r, 450));
   assert.equal(lock!.isLost(), true, "the watchdog must have declared loss from the short lease expiring, independent of the in-flight renewal");
   assert.equal(lostCalls, 1);
 
   // Now wait for the delayed renewal's late-arriving (successful)
   // response to actually resolve, and confirm it changed nothing.
-  await new Promise((r) => setTimeout(r, 250));
+  await new Promise((r) => setTimeout(r, 500));
   assert.equal(lock!.isLost(), true, "a delayed successful response must never revive validity once loss was already declared");
   assert.equal(lostCalls, 1, "onLost must still have fired exactly once -- the stale response must not trigger a second declaration or any other side effect");
 

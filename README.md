@@ -127,6 +127,7 @@ Open **http://127.0.0.1:4555** (binds to loopback only by default; override with
 **Current limitations:**
 - No authentication -- loopback-only binding, origin checking, and the singleton lock are the only access/contention controls; do not expose this port beyond localhost.
 - Single active run per server process, no persistence of the AbortController across a restart -- by design, stated as the local execution model this is, not a limitation to be read as a bug.
+- Deterministic and restore cancellation barriers use a test-only slow verification fixture (see `tests/integration/cancellation-barriers.test.ts`'s header) so the mid-container-running moment can be reliably hit; the production fixture itself is unchanged.
 
 ## Break it deliberately
 

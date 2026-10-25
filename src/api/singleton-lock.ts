@@ -77,7 +77,13 @@ export async function acquireSingletonLock(
     acquiredAt = Date.now();
     first = await tryAcquireOrRenewExclusiveLock(pool, ownerId, leaseMs, DEMO_API_LOCK_NAME);
   }
-  if (!first.acquired) return null;
+  // Same conservative anchoring as every renewal below: if the INITIAL
+  // acquisition's own response was itself delayed long enough that the
+  // lease it reports would already be expired by the time we know
+  // about it, this process never genuinely held a USABLE lease -- treat
+  // it the same as not acquired, rather than returning a lock object
+  // that would just self-declare lost on its very first check.
+  if (!first.acquired || Date.now() >= acquiredAt + leaseMs) return null;
 
   let lost = false;
   let leaseValidUntil = acquiredAt + leaseMs;
